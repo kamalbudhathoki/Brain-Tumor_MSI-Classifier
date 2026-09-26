@@ -103,6 +103,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from torchvision.models import ResNet18_Weights, resnet18
 
 # The model's input size must equal the size src/data/transforms.py resizes to.
 # Imported rather than re-typed as a literal: if preprocessing and architecture
