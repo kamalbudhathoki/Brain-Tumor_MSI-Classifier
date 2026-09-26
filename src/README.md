@@ -15,7 +15,8 @@ src/
 ├── models/
 │   └── classifier.py# model factory (build_model(name, num_classes))
 ├── train.py         # training loop, checkpointing, early stopping
-├── evaluate.py      # metrics: accuracy, precision/recall/F1, ROC-AUC, confusion matrix
+├── evaluate.py      # metrics: accuracy, precision/recall/F1, ROC-AUC, confusion
+│                    #   matrix, and the count/recall/precision error-analysis figure
 ├── inference.py     # single-scan and batch prediction, returns probabilities + label
 ├── registry.py      # model/checkpoint bookkeeping (what exists, what is best)
 └── utils/

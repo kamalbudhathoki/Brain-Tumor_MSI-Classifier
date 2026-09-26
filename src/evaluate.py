@@ -13,6 +13,7 @@ reports the four numbers that decide whether the model is any good:
     python -m src.evaluate --checkpoint models/<run>/best.pt --split test
     python -m src.evaluate --save-report outputs/eval/test_report.json \
                            --save-confusion-matrix outputs/eval/cm.png
+    python -m src.evaluate --save-error-analysis outputs/eval/errors.png
 
 The pipeline is four steps, and each one is a plain function you can call on its own:
 
@@ -20,6 +21,7 @@ The pipeline is four steps, and each one is a plain function you can call on its
     compute_metrics()      y_true, y_pred      ->  ClassificationMetrics
     render_report()        metrics             ->  a formatted text report
     plot_confusion_matrix  metrics             ->  a PNG (optional)
+    plot_error_analysis    metrics             ->  a three-view PNG (optional)
 
 `compute_metrics()` deliberately takes numpy arrays and knows nothing about torch,
 so the metric maths can be tested and reused without a model in the room.
@@ -75,6 +77,54 @@ CONFIDENCE MATRIX
     problem, which a single scalar cannot. A model with 93% accuracy whose errors
     are all meningioma-called-glioma is a very different artefact from one that is
     93% accurate by spreading errors evenly, and only the second table shows it.
+
+READING THE WRONG PREDICTIONS
+-----------------------------
+A wrong prediction is a cell off the diagonal, and the same cell means two
+different things depending on which way you read it. This is the single easiest
+thing to get backwards when reading a confusion matrix, so both figures built here
+print the rule on the image itself, under the caption:
+
+    read ALONG a row   the row is everything that really was class `c`, so an
+                       off-diagonal cell is a MISS -- a false negative for `c`.
+                       A real glioma scan the model called meningioma. The
+                       dangerous direction: the tumour was there and the model
+                       did not find it.
+    read DOWN a column  the column is everything the model called class `j`, so
+                       an off-diagonal cell is a FALSE ALARM -- a false positive
+                       for `j`. A healthy scan the model called glioma. The
+                       expensive direction: a follow-up scan or a biopsy for
+                       nothing.
+
+Both numbers matter and they are not the same cell's fault. Summing a row tells
+you what a class costs you when it is missed; summing a column tells you what a
+class costs you when it is over-called. A model can be excellent on both for one
+class and terrible on both for another, and only the per-class rows say which --
+which is why the figure puts the same matrix on screen three times, once per
+denominator:
+
+    counts              what actually happened. The only panel whose cells can be
+                        added up into "how many scans were wrong".
+    row-normalised      cell (c, j) = of the real `c` scans, this share were
+                        called `j`. The diagonal is per-class RECALL, and a pale
+                        row is a class the model keeps missing.
+    column-normalised   cell (c, j) = of everything called `j`, this share really
+                        was `j`. The diagonal is per-class PRECISION, and a dark
+                        column is a class the model over-calls.
+
+The two errors are worth separating before acting on either. A false negative is
+fixed by making the model *find* more -- more data of that class, a higher recall
+threshold, a class-weighted loss. A false positive is usually fixed at the
+decision boundary rather than in the network, by refusing to predict a class
+unless the probability clears a threshold worth the false-alarm cost. Training
+harder fixes the first twice as often as the second, and never fixes the second
+on its own.
+
+Read the row and the column of the same cell together and the pair tells you which
+of the two problems a class has. `no_tumor` called `glioma` in both directions is
+a model that cannot tell a healthy brain from a tumour at all. `glioma` called
+`meningioma` mostly one way is two similar masses, which is a data and
+architecture problem. Same accuracy, same off-diagonal cell, different fixes.
 
 AVERAGING, AND WHY MACRO IS THE DEFAULT HERE
 --------------------------------------------
@@ -141,9 +191,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import textwrap
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from types import ModuleType
 from typing import Sequence
 
 import numpy as np
@@ -205,6 +257,7 @@ class EvalConfig:
     report_path: Path | None = None
     confusion_matrix_path: Path | None = None
     normalize_confusion_matrix: bool = False
+    error_analysis_path: Path | None = None
 
     def validate(self) -> None:
         """Reject nonsense before loading a model."""
@@ -861,79 +914,600 @@ def render_report(
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Confusion matrix figures
+# ---------------------------------------------------------------------------
+
+#: Warm fill laid over a wrong prediction. A heatmap cannot say "wrong" by colour
+#: alone -- only position says that -- so every non-zero off-diagonal cell gets a
+#: second, positional cue that survives greyscale printing and colour-vision
+#: deficiency. Alpha is kept low deliberately: the fill must not overwrite the
+#: value the colour is encoding, or the figure trades one lie for another.
+_ERROR_FACE = "#f5c6a9"
+_ERROR_EDGE = "#b03a2e"
+
+#: Outline of the diagonal band, i.e. the correct predictions.
+_CORRECT_EDGE = "#0f766e"
+
+#: One sequential map for every panel. A rainbow map would be flashier and wrong:
+#: these cells hold magnitudes that readers compare against each other, and a
+#: rainbow paints a hard yellow/green edge through a gradient that is not in the
+#: data. `Blues` also stays legible when the figure is printed in black and white,
+#: which is where most of these end up.
+_CMAP = "Blues"
+
+#: Cached pyplot module, so the backend is chosen once and the import cost is
+#: paid once. See `_pyplot`.
+_PYPLOT: ModuleType | None = None
+
+#: The views available, keyed by the name `_build_panels` and the plotting
+#: functions use. The third element is the axis each line is summed over before
+#: dividing -- 1 normalises within a row (the recall view), 0 within a column (the
+#: precision view), and `None` leaves the counts alone.
+_VIEWS: dict[str, tuple[str, str, int | None, str]] = {
+    "counts": (
+        "Counts",
+        "how many scans landed in each cell",
+        None,
+        "scans",
+    ),
+    "recall": (
+        "Row-normalised (recall)",
+        "share of each true class, row by row",
+        1,
+        "share of row",
+    ),
+    "precision": (
+        "Column-normalised (precision)",
+        "share of each prediction, column by column",
+        0,
+        "share of column",
+    ),
+}
+
+#: Shown in a cell whose line had no examples at all, so the value is undefined
+#: rather than zero. Reuses the report's placeholder for the same reason: a class
+#: the split never contained must not read as a class the model got wrong every time.
+_UNMEASURABLE = NOT_AVAILABLE
+
+#: Caption type size, and the rough width of one character of it as a fraction of
+#: that size. The ratio is an estimate and only ever decides where to break a
+#: line. It is deliberately set high (wide characters), so a line that just fits
+#: the estimate is still short enough once the real font is measured.
+_CAPTION_SIZE = 8.2
+_CAPTION_CHAR_RATIO = 0.55
+
+#: Blank space kept at each edge of the figure when wrapping, in inches. Without
+#: it a line that exactly fills the estimate still loses its last character or two
+#: to the canvas edge, and a clipped caption is worse than an early line break.
+_CAPTION_SIDE_PAD = 0.12
+
+#: Vertical space the caption block needs, per line and once for padding, in inches.
+_CAPTION_LINE_PITCH = 0.17
+_CAPTION_PAD = 0.08
+
+#: Space above the panels for the figure title and the headline numbers, in inches.
+_HEAD_MARGIN = 1.0
+
+
+@dataclass(frozen=True)
+class ConfusionPanel:
+    """One heatmap within a confusion-matrix figure.
+
+    The views are the same table under different denominators, so they are
+    described as data rather than drawn as separate hand-written plotting
+    functions. Three copies of the axis, tick and annotation handling is three
+    places for a label to go wrong, and a fourth view added later would be a
+    copy-paste rather than a new entry in `_VIEWS`.
+    """
+
+    key: str
+    title: str
+    subtitle: str
+    matrix: np.ndarray
+    measurable: np.ndarray
+    """False where a cell's value is undefined rather than zero: the whole row or
+    column of a class that had no examples in this split."""
+
+    colorbar_label: str
+    as_percent: bool
+    """Cell labels read as percentages for the normalised views. "94.2%" is a
+    share of a known denominator, whereas "0.94" invites the reader to work out
+    which denominator, and getting that backwards is the whole risk here."""
+
+
+def _pyplot() -> ModuleType:
+    """Import pyplot once, on the non-interactive backend.
+
+    Same lazy-import contract as `src.plots._pyplot`, and for the same reasons:
+    matplotlib is a heavy import that a text-only evaluation has no reason to pay
+    for, and the backend is chosen before anything else can grab pyplot --
+    `matplotlib.use()` after the fact is a no-op on some versions.
+    """
+    global _PYPLOT
+    if _PYPLOT is None:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        _PYPLOT = plt
+    return _PYPLOT
+
+
+def _display_label(name: str) -> str:
+    """`no_tumor` -> `No Tumor`, for the axis ticks and the caption.
+
+    Presentation only; the underlying class names are never rewritten, because
+    they are the keys the checkpoint is indexed by. Underscores and hyphens become
+    spaces and each word is title-cased, which is what makes an axis of
+    `no_tumor` / `glioma` / `meningioma` / `pituitary` read as four class names
+    rather than four identifiers. Only the first letter of each word is touched,
+    so an acronym like `MRI` survives intact where `str.title()` would mangle it
+    into `Mri`.
+    """
+    words = name.replace("_", " ").replace("-", " ").split()
+    return " ".join(word[:1].upper() + word[1:] for word in words)
+
+
+def _shares(matrix: np.ndarray, axis: int) -> tuple[np.ndarray, np.ndarray]:
+    """Divide each line along `axis` by its own total, plus a mask of full lines.
+
+    `axis=1` gives cell `(i, j)` the reading "of the real class `i` scans, this
+    share was called `j`" -- the recall view, in which a weak class is obvious
+    because its whole row is pale. `axis=0` gives "of everything called `j`, this
+    share really was `j`" -- the precision view, in which an over-called class is
+    obvious because its column is dark.
+
+    A line that summed to zero becomes all-zero instead of NaN, and the mask
+    records which lines those were so their cells can be labelled `n/a`.
+    """
+    totals = matrix.sum(axis=axis, keepdims=True)
+    shares = np.divide(matrix, totals, out=np.zeros_like(matrix), where=totals > 0)
+    measurable = np.array(np.broadcast_to(totals > 0, matrix.shape), dtype=bool)
+    return shares, measurable
+
+
+def _build_panels(counts: np.ndarray, keys: Sequence[str]) -> list[ConfusionPanel]:
+    """Turn raw counts into the requested views, in the order asked for."""
+    panels: list[ConfusionPanel] = []
+    for key in keys:
+        if key not in _VIEWS:
+            raise ValueError(
+                f"Unknown confusion-matrix view {key!r}. "
+                f"Expected any of: {', '.join(_VIEWS)}."
+            )
+
+        title, subtitle, axis, colorbar_label = _VIEWS[key]
+        if axis is None:
+            matrix = counts
+            measurable = np.ones(counts.shape, dtype=bool)
+        else:
+            matrix, measurable = _shares(counts, axis)
+
+        panels.append(
+            ConfusionPanel(
+                key=key,
+                title=title,
+                subtitle=subtitle,
+                matrix=matrix,
+                measurable=measurable,
+                colorbar_label=colorbar_label,
+                as_percent=axis is not None,
+            )
+        )
+    return panels
+
+
+def _diagonal_band(n_classes: int) -> list[tuple[float, float]]:
+    """Vertices of the staircase band covering cells `(i, i)`.
+
+    One outline around the whole diagonal rather than a box per cell. The correct
+    predictions *are* a single stripe, and drawing them as a stripe is what makes
+    the off-diagonal cells read as the exception instead of as more of the same.
+    """
+    if n_classes < 1:
+        return []
+    top = [(i - 0.5, i + 0.5) for i in range(n_classes)]
+    top += [(i + 0.5, i + 0.5) for i in range(n_classes)]
+    return top + [(x, y - 1.0) for x, y in reversed(top)]
+
+
+def _draw_panel(
+    plt: ModuleType,
+    axes: ModuleType,
+    panel: ConfusionPanel,
+    labels: Sequence[str],
+    *,
+    highlight: tuple[int, int] | None = None,
+) -> None:
+    """Draw one heatmap: colour, the diagonal band, error cells, and the numbers."""
+    from matplotlib.patches import Polygon, Rectangle
+
+    n_classes = len(labels)
+    matrix = panel.matrix
+    peak = float(matrix.max()) if matrix.size else 0.0
+    # Share panels are pinned to a full 0..1 scale so two of them sitting next to
+    # each other are directly comparable; a counts panel is scaled to its own
+    # largest cell, or one big cell would flatten the rest into the background.
+    vmax = 1.0 if panel.as_percent else max(1.0, peak)
+
+    axes.imshow(matrix, interpolation="nearest", cmap=_CMAP, vmin=0.0, vmax=vmax)
+
+    # Every non-zero off-diagonal cell is a wrong prediction, so it gets the warm
+    # fill and a red edge. Zero cells are left bare: "the model never made this
+    # mistake" and "this mistake is invisible at this colour scale" are different
+    # statements, and only the first one is true of an empty cell.
+    for i in range(n_classes):
+        for j in range(n_classes):
+            if i != j and matrix[i, j] > 0:
+                axes.add_patch(
+                    Rectangle(
+                        (j - 0.5, i - 0.5),
+                        1.0,
+                        1.0,
+                        facecolor=_ERROR_FACE,
+                        edgecolor=_ERROR_EDGE,
+                        linewidth=0.9,
+                        alpha=0.30,
+                        zorder=2,
+                    )
+                )
+
+    if matrix.shape == (n_classes, n_classes):
+        axes.add_patch(
+            Polygon(
+                _diagonal_band(n_classes),
+                closed=True,
+                fill=False,
+                edgecolor=_CORRECT_EDGE,
+                linewidth=1.6,
+                joinstyle="miter",
+                zorder=3,
+            )
+        )
+
+    if highlight is not None:
+        axes.add_patch(
+            Rectangle(
+                (highlight[1] - 0.5, highlight[0] - 0.5),
+                1.0,
+                1.0,
+                fill=False,
+                edgecolor=_ERROR_EDGE,
+                linewidth=2.4,
+                zorder=4,
+            )
+        )
+
+    for i in range(n_classes):
+        for j in range(n_classes):
+            if not panel.measurable[i, j]:
+                text, color = _UNMEASURABLE, "#9a9a9a"
+            else:
+                value = float(matrix[i, j])
+                text = f"{value:.1%}" if panel.as_percent else f"{int(value)}"
+                color = "white" if value > 0.55 * vmax else "black"
+            axes.text(
+                j, i, text, ha="center", va="center", color=color, fontsize=8.5, zorder=5
+            )
+
+    # Every class named on both axes. The rotation is chosen from the longest
+    # label rather than hard-coded, so short class names get horizontal ticks and
+    # a long one gets room instead of running into its neighbour.
+    ticks = list(range(n_classes))
+    longest = max((len(label) for label in labels), default=0)
+    axes.set_xticks(
+        ticks,
+        labels,
+        rotation=45 if longest > 8 else 0,
+        ha="right" if longest > 8 else "center",
+    )
+    axes.set_yticks(ticks, labels)
+    # These two are the labels that make the matrix readable; without them a
+    # reader has to guess whether row or column is the truth, and a transposed
+    # matrix is the classic silent reporting bug.
+    axes.set_xlabel("Predicted class", fontsize=9.5)
+    axes.set_ylabel("True class", fontsize=9.5)
+    axes.set_title(panel.title, fontsize=11, fontweight="bold", pad=16)
+    axes.text(
+        0.5,
+        1.015,
+        panel.subtitle,
+        transform=axes.transAxes,
+        ha="center",
+        va="bottom",
+        fontsize=8.5,
+        color="#666666",
+    )
+    axes.tick_params(length=0, labelsize=9)
+    for spine in axes.spines.values():
+        spine.set_edgecolor("#cccccc")
+
+    figure = axes.get_figure()
+    figure.colorbar(
+        axes.get_images()[0],
+        ax=axes,
+        fraction=0.046,
+        pad=0.04,
+        label=panel.colorbar_label,
+    ).ax.tick_params(length=0, labelsize=8)
+
+
+def _figure_caption(metrics: ClassificationMetrics, labels: Sequence[str]) -> list[str]:
+    """The reading guide printed under the figure, worst finding included.
+
+    The two orientation lines are the answer to "how do I read the wrong
+    predictions", stated in the figure itself: a cell off the diagonal is a miss
+    when you read it along its row, and a false alarm when you read it down its
+    column, and saying that once here is what stops the two being confused.
+    """
+    lines = [
+        "Rows = true class · columns = predicted class · "
+        "the diagonal is the set of correct predictions.",
+        "Off the diagonal, read along a row it is a miss (false negative) for that "
+        "row's class; read down a column it is a false alarm (false positive) for "
+        "that column's class.",
+    ]
+
+    if metrics.errors:
+        pairs = " · ".join(
+            f"{labels[_class_index(metrics, true_name)]} → "
+            f"{labels[_class_index(metrics, pred_name)]} {count}"
+            for true_name, pred_name, count in metrics.errors[:3]
+        )
+        lines.append(f"Largest mistakes: {pairs}.")
+    else:
+        lines.append("No misclassifications on this split.")
+
+    weakest = min(
+        (row for row in metrics.per_class if row.is_measurable),
+        key=lambda row: row.recall,
+        default=None,
+    )
+    if weakest is not None:
+        missed = int(weakest.support) - int(
+            np.asarray(metrics.confusion_matrix)[
+                _class_index(metrics, weakest.name),
+                _class_index(metrics, weakest.name),
+            ]
+        )
+        if missed:
+            lines.append(
+                f"Weakest class by recall: {labels[_class_index(metrics, weakest.name)]} "
+                f"at {weakest.recall:.1%} -- {missed} of {int(weakest.support)} real "
+                f"scans were called something else."
+            )
+    return lines
+
+
+def _wrap_caption(lines: Sequence[str], width_in: float) -> list[str]:
+    """Break the caption so it fits the figure it is printed on.
+
+    The reading guide is deliberately two long sentences -- it is the part of the
+    figure that answers "how do I read the wrong predictions" -- so it is not text
+    to be shortened to fit. Wrapping keeps every word and lets a one-panel figure
+    stay one panel wide instead of becoming as wide as its own caption. Without
+    this the guide is silently clipped off both edges of the saved PNG, which is
+    the one failure mode a caption cannot have.
+    """
+    per_line = max(
+        30,
+        int(
+            (width_in - 2 * _CAPTION_SIDE_PAD)
+            * 72.0
+            / (_CAPTION_SIZE * _CAPTION_CHAR_RATIO)
+        ),
+    )
+    wrapped: list[str] = []
+    for line in lines:
+        wrapped.extend(textwrap.wrap(line, width=per_line) or [line])
+    return wrapped
+
+
+def _class_index(metrics: ClassificationMetrics, name: str) -> int:
+    """Where `name` sits in the matrix, falling back to 0 for an unknown name.
+
+    The fallback is for the caption only: it must not raise part-way through
+    building a figure, and a name that is not in the matrix is already a bug
+    worth reporting in the JSON, not a reason to lose the whole picture.
+    """
+    try:
+        return metrics.class_names.index(name)
+    except ValueError:
+        return 0
+
+
+def _draw_confusion_figure(
+    metrics: ClassificationMetrics,
+    panels: Sequence[ConfusionPanel],
+    path: str | Path,
+    *,
+    dpi: int = 150,
+    title: str | None = None,
+) -> Path:
+    """Render `panels` side by side into one PNG. Shared by both public plotters.
+
+    Raises:
+        ValueError: no class names, so there is nothing to plot.
+    """
+    plt = _pyplot()
+
+    if not metrics.class_names:
+        raise ValueError(
+            "Cannot draw a confusion matrix for an empty class list -- there are "
+            "no labels to put on the axes."
+        )
+
+    labels = [_display_label(name) for name in metrics.class_names]
+    columns = max(1, len(panels))
+
+    # Everything below is sized in inches rather than as a fraction of the figure,
+    # because the caption has to be measured against the width it will be printed
+    # at: a panel grows with the class count, and a fixed margin cannot know how
+    # many lines the caption will need until the width is known.
+    panel_size = max(3.0, 0.62 * len(labels) + 1.5)
+    cbar_space = 0.7  # the colourbar and its label, per panel
+    width = columns * (panel_size + cbar_space) + 0.5
+    caption = _wrap_caption(_figure_caption(metrics, labels), width)
+    caption_h = _CAPTION_LINE_PITCH * len(caption) + _CAPTION_PAD
+    height = panel_size + 2.3 + caption_h
+
+    # The engine must be attached *before* the colourbars are made:
+    # `figure.colorbar(ax=...)` shrinks the parent axes by editing the gridspec,
+    # and doing that with no engine attached leaves a zero-height row that
+    # constrained layout then trips over. `rect` is (left, bottom, width, height)
+    # for this engine, not the corner pair tight_layout takes.
+    figure = plt.figure(figsize=(width, height), layout="constrained")
+    figure.get_layout_engine().set(
+        rect=(0.0, caption_h / height, 1.0, 1.0 - (caption_h + _HEAD_MARGIN) / height)
+    )
+    axes_list = figure.subplots(1, columns, squeeze=False)[0]
+
+    # The single worst confusion gets a heavy ring, but only on the counts panel:
+    # its magnitude is only meaningful against the other counts.
+    counts_panel = next((panel for panel in panels if panel.key == "counts"), None)
+    highlight = None
+    if counts_panel is not None and metrics.errors:
+        true_name, pred_name, _ = metrics.errors[0]
+        if true_name in metrics.class_names and pred_name in metrics.class_names:
+            highlight = (
+                metrics.class_names.index(true_name),
+                metrics.class_names.index(pred_name),
+            )
+
+    for axes, panel in zip(axes_list, panels):
+        _draw_panel(
+            plt, axes, panel, labels, highlight=highlight if panel is counts_panel else None
+        )
+
+    # Headline numbers, so the figure can be read on its own once it has been
+    # pasted into a notebook or a slide. Placed by hand in the margin reserved
+    # above, because the constrained engine only manages what is inside `rect`.
+    figure.text(
+        0.5,
+        1.0 - 0.22 / height,
+        title or "Confusion matrix",
+        ha="center",
+        va="center",
+        fontsize=14,
+        fontweight="bold",
+    )
+    figure.text(
+        0.5,
+        1.0 - 0.62 / height,
+        f"{metrics.n_samples} scans · {len(labels)} classes · "
+        f"accuracy {metrics.accuracy:.1%} · macro F1 {metrics.macro_f1:.1%}",
+        ha="center",
+        va="center",
+        fontsize=9.5,
+        color="#555555",
+    )
+
+    # The reading guide, as one multi-line artist so matplotlib owns the line
+    # pitch -- measuring each line's box by hand and nudging them apart is how
+    # captions end up overlapping. Nothing here may call tight_layout(): it would
+    # fight the constrained engine for the same space.
+    figure.text(
+        0.5,
+        0.04 / height,
+        "\n".join(caption),
+        ha="center",
+        va="bottom",
+        fontsize=_CAPTION_SIZE,
+        linespacing=1.45,
+        color="#444444",
+    )
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path, dpi=dpi, facecolor="white")
+    plt.close(figure)
+    logger.info("Confusion matrix figure written to %s", path)
+    return path
+
+
 def plot_confusion_matrix(
     metrics: ClassificationMetrics,
     path: str | Path,
     *,
     normalize: bool = False,
+    dpi: int = 150,
+    title: str | None = None,
 ) -> Path:
     """Save the confusion matrix as a PNG.
 
-    `normalize=True` divides each row by its own total, turning counts into
-    per-class recall -- the cell in row `c` then reads directly as "of the real
-    `c` scans, this fraction were called `j`", which is the view that makes a weak
-    class obvious. The un-normalized view is the one to quote, because a rare class
-    otherwise looks like a rounding error.
+    Args:
+        metrics: the scored split. `metrics.class_names` labels both axes, in the
+            checkpoint's own order, and `metrics.confusion_matrix` is read as
+            rows = true, columns = predicted.
+        path: destination PNG. Parent directories are created.
+        normalize: `False` shows raw counts, which is the view to quote, because a
+            rare class otherwise looks like a rounding error. `True` divides each
+            row by its own total, so cell `(c, j)` reads directly as "of the real
+            `c` scans, this share were called `j`" -- the view that makes a weak
+            class obvious. The counts of what was missed are still recoverable
+            from the per-class rows in `render_report`.
+        dpi: passed to `savefig`.
+        title: overrides the figure heading, e.g. the run name.
 
-    matplotlib is imported inside the function: it is a heavy import that a
-    text-only evaluation has no reason to pay for, and this keeps the module
-    usable if it is ever optional.
+    Returns:
+        The path written.
+
+    Raises:
+        ValueError: `metrics` carries no class names.
+
+    For the three-view figure that puts counts, per-class recall and per-class
+    precision side by side, and explains the error cells in the caption, use
+    `plot_error_analysis` instead.
     """
-    import matplotlib
+    counts = np.asarray(metrics.confusion_matrix, dtype=np.float64)
+    panels = _build_panels(counts, ("recall",) if normalize else ("counts",))
+    return _draw_confusion_figure(metrics, panels, path, dpi=dpi, title=title)
 
-    # A file on disk is the only destination here, so pick the non-interactive
-    # backend rather than letting a headless session fail at savefig time.
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
 
-    matrix = np.asarray(metrics.confusion_matrix, dtype=np.float64)
-    if normalize:
-        row_totals = matrix.sum(axis=1, keepdims=True)
-        # A class with no examples stays all-zero instead of becoming NaN.
-        matrix = np.divide(
-            matrix, row_totals, out=np.zeros_like(matrix), where=row_totals > 0
-        )
+def plot_error_analysis(
+    metrics: ClassificationMetrics,
+    path: str | Path,
+    *,
+    dpi: int = 150,
+    title: str | None = None,
+) -> Path:
+    """Save the three-view error-analysis figure: counts, recall, precision.
 
-    size = max(5.0, 0.9 * len(metrics.class_names) + 2.5)
-    figure, axes = plt.subplots(figsize=(size, size))
-    image = axes.imshow(matrix, interpolation="nearest", cmap="Blues")
-    figure.colorbar(image, ax=axes, fraction=0.046, pad=0.04)
+    One matrix, three denominators, because no single one of them answers the
+    question being asked:
 
-    ticks = range(len(metrics.class_names))
-    axes.set_xticks(list(ticks), metrics.class_names, rotation=45, ha="right")
-    axes.set_yticks(list(ticks), metrics.class_names)
-    # These two are the labels that make the matrix readable; without them a
-    # reader has to guess whether row or column is the truth.
-    axes.set_xlabel("Predicted")
-    axes.set_ylabel("True")
-    axes.set_title(
-        "Confusion matrix (rows = true, cols = predicted)"
-        + (" [row-normalised]" if normalize else "")
-    )
+        counts     what actually happened, and the only view whose cells can be
+                   added up into "how many scans were wrong"
+        recall     row-normalised -- for each true class, the share of it that was
+                   found. A pale row is a class the model keeps missing, however
+                   few scans it has.
+        precision  column-normalised -- for each prediction, the share that was
+                   real. A dark column is a class the model over-calls.
 
-    # Cell annotations. The colour flips past 0.5 * max so dark cells get light
-    # text and stay readable at a glance.
-    threshold = matrix.max() / 2.0 if matrix.size else 0.0
-    for i, name_i in enumerate(metrics.class_names):
-        for j, _ in enumerate(metrics.class_names):
-            value = matrix[i, j]
-            axes.text(
-                j,
-                i,
-                f"{value:.2f}" if normalize else f"{int(value)}",
-                ha="center",
-                va="center",
-                color="white" if value > threshold else "black",
-                fontsize=9,
-            )
+    The two normalised views are the same table read along the other axis, and
+    they are the reason this figure exists: the diagonal of the recall panel is
+    per-class recall, the diagonal of the precision panel is per-class precision,
+    and an off-diagonal cell is a false negative in one and a false positive in
+    the other. One counts the misses, the other counts the false alarms, and a
+    model that confuses glioma with meningioma shows up in both at once.
 
-    figure.tight_layout()
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(path, dpi=150)
-    plt.close(figure)
-    logger.info("Confusion matrix written to %s", path)
-    return path
+    Args:
+        metrics: the scored split, as for `plot_confusion_matrix`.
+        path: destination PNG. Parent directories are created.
+        dpi: passed to `savefig`.
+        title: overrides the figure heading, e.g. the run name.
+
+    Returns:
+        The path written.
+
+    Raises:
+        ValueError: `metrics` carries no class names.
+    """
+    counts = np.asarray(metrics.confusion_matrix, dtype=np.float64)
+    panels = _build_panels(counts, ("counts", "recall", "precision"))
+    return _draw_confusion_figure(metrics, panels, path, dpi=dpi, title=title)
 
 
 def save_report(metrics: ClassificationMetrics, path: str | Path) -> Path:
@@ -1100,6 +1674,11 @@ def parse_args(argv: list[str] | None = None) -> EvalConfig:
                         default=defaults.normalize_confusion_matrix,
                         help="divide each matrix row by its total, i.e. show "
                              "per-class recall instead of raw counts")
+    parser.add_argument("--save-error-analysis", type=Path,
+                        default=defaults.error_analysis_path,
+                        help="render the three-view figure -- counts, per-class "
+                             "recall and per-class precision side by side, with "
+                             "the wrong predictions called out -- to this PNG")
 
     args = parser.parse_args(argv)
     return EvalConfig(
@@ -1115,7 +1694,30 @@ def parse_args(argv: list[str] | None = None) -> EvalConfig:
         report_path=args.save_report,
         confusion_matrix_path=args.save_confusion_matrix,
         normalize_confusion_matrix=args.normalize_confusion_matrix,
+        error_analysis_path=args.save_error_analysis,
     )
+
+
+def _figure_title(cfg: EvalConfig, info: CheckpointInfo) -> str:
+    """Heading for a figure: which run, and which split.
+
+    A confusion matrix copied out of `outputs/` into a notebook or a slide loses
+    the folder it came from, and a matrix without its split on it is a number
+    nobody can check.
+
+    The run name is the checkpoint's *parent directory*, not its filename:
+    `src/train.py` writes every run as `<run_name>/best.pt` and `<run_name>/last.pt`,
+    so the stem is "best" or "last" for every run ever trained and identifies
+    none of them. The stem is only added, and only when it is not one of those
+    two, so a differently-named checkpoint is still distinguishable.
+    """
+    path = info.path
+    run_name = path.parent.name if path is not None else ""
+    if path is None or run_name in ("", ".", "models"):
+        run_name = path.stem if path is not None else "untitled"
+    elif path.stem not in ("best", "last"):
+        run_name = f"{run_name} ({path.stem})"
+    return f"{run_name} · split={cfg.split}"
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -1157,6 +1759,11 @@ def main(argv: list[str] | None = None) -> None:
             metrics,
             cfg.confusion_matrix_path,
             normalize=cfg.normalize_confusion_matrix,
+            title=_figure_title(cfg, info),
+        )
+    if cfg.error_analysis_path is not None:
+        plot_error_analysis(
+            metrics, cfg.error_analysis_path, title=_figure_title(cfg, info)
         )
 
 
