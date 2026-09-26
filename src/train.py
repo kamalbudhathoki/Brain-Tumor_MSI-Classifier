@@ -109,6 +109,7 @@ class TrainConfig:
     augment: bool = True
     class_weighted: bool = False
     early_stopping_patience: int | None = 5
+    early_stopping_min_delta: float = 0.0
 
     # --- runtime ---
     num_workers: int = 0
@@ -132,6 +133,16 @@ class TrainConfig:
             raise ValueError(f"lr must be > 0, got {self.lr}")
         if self.num_classes < 2:
             raise ValueError(f"num_classes must be >= 2, got {self.num_classes}")
+        if self.early_stopping_patience is not None and self.early_stopping_patience < 1:
+            raise ValueError(
+                f"early_stopping_patience must be >= 1 or None, "
+                f"got {self.early_stopping_patience}"
+            )
+        if self.early_stopping_min_delta < 0:
+            raise ValueError(
+                f"early_stopping_min_delta must be >= 0, "
+                f"got {self.early_stopping_min_delta}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +397,134 @@ def build_criterion(
 
 
 # ---------------------------------------------------------------------------
+# Early stopping
+# ---------------------------------------------------------------------------
+
+
+class EarlyStopping:
+    """Stop training when the monitored validation metric stops improving.
+
+    WHY EARLY STOPPING PREVENTS OVERFITTING
+    ---------------------------------------
+    Every epoch, gradient descent optimises the loss on the *training* set. Left
+    alone it will happily drive that number toward zero, because a network with
+    millions of parameters can memorise a finite dataset. Training loss falling
+    forever is therefore not evidence of learning -- past a point it is evidence
+    of memorisation.
+
+    The validation set is the tell. It is data the model has never trained on, so
+    it measures generalisation rather than recall. The two curves diverge:
+
+        epoch   train loss   val loss     what is happening
+        -----   ----------   -------     ---------------------------------
+        1        0.85         0.80        both falling: real learning
+        5        0.42         0.45        still learning, but slowing
+        9        0.21         0.44        training loss keeps falling...
+        14       0.06         0.52        ...while val loss climbs: memorising
+        19       0.01         0.61        the training set, nothing more
+
+    From epoch ~9 onward, each additional epoch makes the model *worse at the
+    actual job*. The minimum of the validation loss curve is the point where
+    generalisation peaked, and continuing past it only moves the weights further
+    from that peak.
+
+    So early stopping does two things at once:
+
+      1. **It stops the damage.** Training halts while the model is still near its
+         best, instead of running to a memorised epoch 19.
+      2. **It is a model-selection rule.** Because it keeps the weights from the
+         best epoch rather than the last, the artifact you ship is the best
+         generalising one the run produced. Restoring those weights at the end is
+         not optional -- without it, stopping early would leave you evaluating the
+         final (worst) epoch.
+
+    It is regularisation in the truest sense: an implicit constraint on *how long*
+    you may fit the data, and one that needs no extra loss term and no extra data.
+    On a dataset this small it is frequently worth more than dropout and colour
+    jitter combined, because those shrink the model's capacity while early
+    stopping simply refuses to let it use the capacity it has for the wrong thing.
+
+    It is a heuristic, not a guarantee. A validation set that is too small is
+    noisy, and a lucky dip can stop a run several epochs early -- which is what
+    `min_delta` exists to blunt, and why the patience is 5 rather than 1.
+
+    Args:
+        patience: epochs without improvement tolerated before stopping. `None`
+            disables early stopping entirely and runs all epochs.
+        mode: `"min"` for a quantity that should decrease (validation **loss**,
+            which is what this project monitors), `"max"` for one that should
+            increase (validation accuracy).
+        min_delta: smallest change that still counts as an improvement. Raising
+            it above 0 stops the run from restarting on a new "best" that is
+            within noise of the old one.
+
+    Note this class deliberately has no torch dependency, so the stopping logic
+    can be tested on its own without a model, a dataset, or a GPU.
+    """
+
+    def __init__(
+        self,
+        patience: int | None = 5,
+        mode: str = "min",
+        min_delta: float = 0.0,
+    ) -> None:
+        if patience is not None and patience < 1:
+            raise ValueError(f"patience must be >= 1 or None, got {patience}")
+        if mode not in ("min", "max"):
+            raise ValueError(f"mode must be 'min' or 'max', got {mode!r}")
+        if min_delta < 0:
+            raise ValueError(f"min_delta must be >= 0, got {min_delta}")
+
+        self.patience = patience
+        self.mode = mode
+        self.min_delta = min_delta
+
+        self.best: float | None = None
+        self.best_epoch: int | None = None
+        self.num_bad_epochs = 0
+
+    def _is_improvement(self, value: float) -> bool:
+        """Is `value` better than the best seen so far?"""
+        if self.best is None:
+            return True  # the first epoch always sets the bar
+        if self.mode == "min":
+            return value < self.best - self.min_delta
+        return value > self.best + self.min_delta
+
+    def step(self, value: float, epoch: int | None = None) -> bool:
+        """Record one epoch's metric. Returns True if it is a new best.
+
+        Note that `best` is only updated on a genuine improvement, so a worse
+        epoch never destroys the high-water mark.
+        """
+        improved = self._is_improvement(value)
+
+        if improved:
+            self.best = value
+            self.best_epoch = epoch
+            # Patience resets only on real progress, so five consecutive
+            # non-improvements are required -- not five bad epochs spread across
+            # a run that kept improving in between.
+            self.num_bad_epochs = 0
+        else:
+            self.num_bad_epochs += 1
+
+        return improved
+
+    @property
+    def should_stop(self) -> bool:
+        """Derived, never stored, so it cannot go stale relative to the counter."""
+        return self.patience is not None and self.num_bad_epochs >= self.patience
+
+    def __repr__(self) -> str:
+        return (
+            f"EarlyStopping(patience={self.patience}, mode={self.mode!r}, "
+            f"min_delta={self.min_delta}, best={self.best}, "
+            f"best_epoch={self.best_epoch}, num_bad_epochs={self.num_bad_epochs})"
+        )
+
+
+# ---------------------------------------------------------------------------
 # The loop
 # ---------------------------------------------------------------------------
 
@@ -562,9 +701,20 @@ def train(cfg: TrainConfig) -> Path:
     best_path = run_dir / "best.pt"
     last_path = run_dir / "last.pt"
 
-    best_val_acc = -1.0
-    best_epoch = -1
-    epochs_without_improvement = 0
+    # Monitors validation LOSS, not accuracy. Loss is the smoother signal: it
+    # moves every epoch, whereas accuracy on a few hundred validation images is a
+    # step function that can sit flat for five epochs and then jump, which makes a
+    # patience window on accuracy either too twitchy or too slow depending on the
+    # split size. The tradeoff is that the epoch chosen for lowest loss is not
+    # necessarily the epoch with the highest accuracy -- with heavy class
+    # weighting the two can disagree, which is why both are logged below.
+    stopper = EarlyStopping(
+        patience=cfg.early_stopping_patience,
+        mode="min",
+        min_delta=cfg.early_stopping_min_delta,
+    )
+
+    best_record: dict[str, float] | None = None
     history: list[dict[str, float]] = []
     started = time.time()
 
@@ -590,13 +740,8 @@ def train(cfg: TrainConfig) -> Path:
             show_progress=cfg.show_progress,
         )
 
-        improved = val_metrics["accuracy"] > best_val_acc
-        if improved:
-            best_val_acc = val_metrics["accuracy"]
-            best_epoch = epoch
-            epochs_without_improvement = 0
-        else:
-            epochs_without_improvement += 1
+        # A new best validation loss: save the weights and reset the patience.
+        improved = stopper.step(val_metrics["loss"], epoch)
 
         record = {
             "epoch": epoch,
@@ -608,6 +753,8 @@ def train(cfg: TrainConfig) -> Path:
             "is_best": improved,
         }
         history.append(record)
+        if improved:
+            best_record = record
 
         logger.info(
             "epoch %d/%d  train loss %.4f acc %.4f  |  val loss %.4f acc %.4f  |  %.1fs%s",
@@ -628,27 +775,34 @@ def train(cfg: TrainConfig) -> Path:
                 {"train": train_metrics, "val": val_metrics},
             )
 
-        # Early stopping. Compares on validation accuracy, and only after a full
-        # epoch has passed with no improvement, so a single bad epoch near a
-        # noisy plateau does not end the run.
-        if (
-            cfg.early_stopping_patience is not None
-            and epochs_without_improvement >= cfg.early_stopping_patience
-        ):
+        # Patience exhausted: the validation loss has not improved for
+        # `early_stopping_patience` consecutive epochs, so generalisation has
+        # stopped getting better and further epochs will only overfit harder.
+        if stopper.should_stop:
             logger.info(
-                "Early stopping: no validation improvement for %d epochs "
-                "(best was epoch %d at %.4f).",
-                cfg.early_stopping_patience, best_epoch, best_val_acc,
+                "Early stopping at epoch %d: validation loss has not improved for "
+                "%d consecutive epochs (best %.4f at epoch %s).",
+                epoch,
+                stopper.num_bad_epochs,
+                stopper.best,
+                stopper.best_epoch,
             )
             break
 
     total_seconds = time.time() - started
 
-    # Roll back to the best weights. Without this, early stopping leaves you
-    # evaluating the *last* epoch, which is by definition worse than the best one.
-    logger.info("Restoring best weights from epoch %d", best_epoch)
+    if best_record is None:
+        # Unreachable in practice -- epoch 1 always sets a best -- but a bare
+        # `None` subscript here would be a mystifying crash.
+        raise RuntimeError("No epoch completed; best_record was never set.")
+
+    # Roll back to the weights from the best epoch. Without this, early stopping
+    # would leave you evaluating the *last* epoch, which is by definition worse
+    # than the best one -- the whole point of stopping would be lost.
+    logger.info("Restoring best weights from epoch %d", stopper.best_epoch)
     best_checkpoint = torch.load(best_path, map_location=device, weights_only=True)
     model.load_state_dict(best_checkpoint["state_dict"])
+
 
     # Now, and only now, look at the test set.
     test_metrics = run_epoch(
@@ -661,8 +815,13 @@ def train(cfg: TrainConfig) -> Path:
         show_progress=cfg.show_progress,
     )
     logger.info(
-        "TEST  loss %.4f  accuracy %.4f   (best val accuracy %.4f at epoch %d)",
-        test_metrics["loss"], test_metrics["accuracy"], best_val_acc, best_epoch,
+        "TEST  loss %.4f  accuracy %.4f   "
+        "(selected on best val loss %.4f at epoch %d, val acc there %.4f)",
+        test_metrics["loss"],
+        test_metrics["accuracy"],
+        best_record["val_loss"],
+        int(best_record["epoch"]),
+        best_record["val_acc"],
     )
 
     # models/README.md calls this config.yaml. Written as JSON because PyYAML is
@@ -675,8 +834,15 @@ def train(cfg: TrainConfig) -> Path:
         json.dumps(
             {
                 "history": history,
-                "best_epoch": best_epoch,
-                "best_val_accuracy": best_val_acc,
+                # `selection_metric` records what early stopping watched, so a
+                # metrics.json from a run that monitored accuracy instead of loss
+                # is not silently comparable with this one.
+                "selection_metric": "val_loss",
+                "best_epoch": stopper.best_epoch,
+                "best_val_loss": stopper.best,
+                "best_epoch_val_accuracy": best_record["val_acc"],
+                "epochs_run": len(history),
+                "stopped_early": stopper.should_stop,
                 "test": test_metrics,
                 "total_seconds": round(total_seconds, 1),
             },
@@ -729,6 +895,9 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
                         action="store_const", const=None,
                         default=defaults.early_stopping_patience,
                         help="always run all --epochs")
+    parser.add_argument("--early-stopping-min-delta", type=float,
+                        default=defaults.early_stopping_min_delta,
+                        help="min val-loss decrease that counts as an improvement")
     parser.add_argument("--no-progress", dest="show_progress", action="store_false",
                         default=defaults.show_progress)
 
@@ -751,6 +920,7 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
         augment=args.augment,
         class_weighted=args.class_weighted,
         early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
         show_progress=args.show_progress,
     )
     return cfg
