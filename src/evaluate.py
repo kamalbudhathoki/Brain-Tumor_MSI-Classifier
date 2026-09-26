@@ -465,7 +465,12 @@ def load_checkpoint(
     arch = str(checkpoint.get("arch", ARCH_NAME))
     num_classes = int(checkpoint.get("num_classes", NUM_CLASSES))
 
-    model = build_model(num_classes=num_classes, name=arch)
+    # `pretrained=False`: the state dict below overwrites every weight, so asking
+    # for ImageNet weights first would download ~45MB to throw away, and would
+    # make loading a checkpoint depend on network access. Harmless for
+    # architectures with no pretrained weights -- build_model() only forwards the
+    # flag to those that have some.
+    model = build_model(num_classes=num_classes, name=arch, pretrained=False)
     try:
         model.load_state_dict(checkpoint["state_dict"])
     except RuntimeError as error:

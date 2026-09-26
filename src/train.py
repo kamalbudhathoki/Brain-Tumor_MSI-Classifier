@@ -50,6 +50,28 @@ loss improve again and so resets the early-stopping patience counter. Keep
 that leaves room for exactly `5 // (2 + 1) == 1` reduction before training
 halts. Setting lr_patience >= early_stopping_patience starves the scheduler --
 it never reduces once, and the run quietly trains at a constant LR.
+
+TRAINING A FROZEN BACKBONE (THE DEFAULT ARCHITECTURE)
+-----------------------------------------------------
+The default model is an ImageNet-pretrained ResNet-18 with everything but the
+512->4 classifier frozen, so three things about this loop are worth stating.
+
+* **The optimizer is built from `trainable_parameters(model)`, not
+  `model.parameters()`.** With a frozen backbone that is 2,052 tensors, and the
+  distinction is logged at startup so the freeze is visible in the run log.
+* **The learning rate default is still 1e-3, and that is conservative.** A
+  frozen-backbone run is optimising a single linear layer on 512 frozen
+  features -- a convex-ish problem with no deep network to traverse -- and
+  `--lr 1e-2` typically converges it in a few epochs instead of many. The
+  default was left alone so the from-scratch baseline (`--arch custom_cnn`)
+  keeps the hyperparameters it was tuned with; change it per run rather than in
+  the dataclass.
+* **Augmentation matters less, but still matters.** The model can no longer
+  memorise the backbone, only 2,052 head parameters, so the train/test gap
+  narrows on its own. The augmentation in `src/data/transforms.py` is still
+  doing real work: the *features* are fixed, so the augmentation's job is now to
+  stop the head from latching onto incidental features of the training scans
+  rather than the diagnostic ones.
 """
 
 from __future__ import annotations
@@ -79,7 +101,7 @@ from .data.transforms import (
     build_eval_transform,
     build_train_transform,
 )
-from .models.classifier import ARCH_NAME, NUM_CLASSES, build_model
+from .models.classifier import ARCH_NAME, NUM_CLASSES, build_model, trainable_parameters
 from .plots import RUNS_SUBDIR, plot_training_curves
 
 logger = logging.getLogger(__name__)
@@ -401,8 +423,9 @@ def build_criterion(
     """Build CrossEntropyLoss, optionally weighting rare classes.
 
     `CrossEntropyLoss` takes **raw logits**, not probabilities, and applies
-    log-softmax internally. `BrainTumorCNN` already ends in a bare `Linear`, which
-    is exactly right -- adding a `Softmax` in the model would apply it twice.
+    log-softmax internally. Both architectures already end in a bare `Linear`,
+    which is exactly right -- adding a `Softmax` in the model would apply it
+    twice.
 
     The dataset is imbalanced (see `notebooks/01_data_exploration.ipynb`), which
     means the loss is dominated by whichever class is most common. `class_weighted`
@@ -715,17 +738,42 @@ def train(cfg: TrainConfig) -> Path:
     class_names = data.class_names
 
     model = build_model(num_classes=cfg.num_classes, name=cfg.arch).to(device)
-    logger.info(
-        "Model: %s -- %s parameters", cfg.arch, f"{model.num_parameters():,}"
-    )
+
+    # Log the freeze, rather than asserting it in a docstring. For a
+    # transfer-learning run the two numbers differ by three orders of magnitude
+    # -- 2,052 trainable out of 11,178,564 for ResNet-18 -- and a log line that
+    # says so is the difference between "the freeze is in there somewhere" and
+    # "the freeze is in this run". A mismatch here (all parameters trainable on an
+    # arch that should be frozen) is the bug that silently costs accuracy, and
+    # it is invisible in the loss curve.
+    total_parameters = model.num_parameters(trainable_only=False)
+    trainable = model.num_parameters(trainable_only=True)
+    if trainable == total_parameters:
+        logger.info(
+            "Model: %s -- %s parameters (all trainable)",
+            cfg.arch, f"{total_parameters:,}",
+        )
+    else:
+        logger.info(
+            "Model: %s -- %s parameters, %s trainable (%.3f%% frozen)",
+            cfg.arch, f"{total_parameters:,}", f"{trainable:,}",
+            100.0 * (total_parameters - trainable) / total_parameters,
+        )
 
     # Adam rather than SGD: with a handful of epochs on a small dataset, Adam's
     # per-parameter adaptive step size converges far faster. Note that Adam's
     # `weight_decay` is L2 added to the gradient, not the decoupled version in
     # AdamW -- close enough for regularisation here, but prefer
     # `torch.optim.AdamW` if you want the decoupled behaviour.
+    #
+    # `trainable_parameters()` rather than `model.parameters()`: the default
+    # architecture has a frozen backbone, and this list is what makes "only the
+    # classifier is finetuned" true in the code rather than only in the config.
+    # Adam would skip the frozen weights anyway (it never steps a parameter whose
+    # `.grad` is None), so this is about clarity and about not handing an
+    # optimizer 11.2M parameters it must reason about each step to move 2,052.
     optimizer = torch.optim.Adam(
-        model.parameters(),
+        trainable_parameters(model),
         lr=cfg.lr,
         weight_decay=cfg.weight_decay,
     )
