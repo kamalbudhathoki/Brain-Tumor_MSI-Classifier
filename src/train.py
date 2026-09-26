@@ -37,10 +37,17 @@ train/val boundary, which inflates validation accuracy. `data/README.md` calls
 patient-level splitting the correct approach; once `data/splits/manifest.csv`
 exists with a `patient_id` column, that is where you should switch.
 
-Also note what is deliberately NOT here: mixed-precision (AMP) and LR
-scheduling. Both belong in this module per the project plan, and both are worth
-adding, but neither is needed to get a correct first number. Adding them before
-the baseline works makes it harder to tell what helped.
+Also note what is deliberately NOT here: mixed-precision (AMP). It is worth
+adding for GPU throughput, but it is not needed to get a correct first number,
+and adding it before the baseline works makes it harder to tell what helped.
+
+Two things work together and their ordering matters. `ReduceLROnPlateau` drops
+the learning rate when the validation loss plateaus, which frequently lets the
+loss improve again and so resets the early-stopping patience counter. Keep
+`lr_patience` (2) below `early_stopping_patience` (5): at the shipped defaults
+that leaves room for exactly `5 // (2 + 1) == 1` reduction before training
+halts. Setting lr_patience >= early_stopping_patience starves the scheduler --
+it never reduces once, and the run quietly trains at a constant LR.
 """
 
 from __future__ import annotations
@@ -111,6 +118,12 @@ class TrainConfig:
     early_stopping_patience: int | None = 5
     early_stopping_min_delta: float = 0.0
 
+    # --- learning-rate schedule ---
+    use_lr_scheduler: bool = True
+    lr_patience: int = 2
+    lr_factor: float = 0.1
+    min_lr: float = 1e-6
+
     # --- runtime ---
     num_workers: int = 0
     device: str = "auto"
@@ -142,6 +155,23 @@ class TrainConfig:
             raise ValueError(
                 f"early_stopping_min_delta must be >= 0, "
                 f"got {self.early_stopping_min_delta}"
+            )
+        if self.lr_patience < 1:
+            raise ValueError(f"lr_patience must be >= 1, got {self.lr_patience}")
+        if not 0.0 < self.lr_factor < 1.0:
+            # >= 1.0 would mean "raise the LR on a plateau", which is not a
+            # thing you want from this scheduler. torch itself allows it; the
+            # data says you do not mean it.
+            raise ValueError(
+                f"lr_factor must be in (0, 1) -- it is a multiplier, not a "
+                f"percentage. Got {self.lr_factor}. Use 0.1 to divide by 10."
+            )
+        if self.min_lr <= 0:
+            raise ValueError(f"min_lr must be > 0, got {self.min_lr}")
+        if self.min_lr > self.lr:
+            raise ValueError(
+                f"min_lr ({self.min_lr}) is above the starting lr ({self.lr}); "
+                "the scheduler could never move the learning rate."
             )
 
 
@@ -688,6 +718,83 @@ def train(cfg: TrainConfig) -> Path:
         weight_decay=cfg.weight_decay,
     )
 
+    # ReduceLROnPlateau: the learning-rate schedule
+    # ------------------------------------------
+    # WHAT A LEARNING RATE IS
+    # Every gradient-descent step moves each weight by roughly
+    # `weight -= lr * gradient`. The learning rate is that step size, and it is
+    # the single most important hyperparameter in the whole script.
+    #
+    # Too small and training crawls -- thousands of epochs to converge, and the
+    # run is usually killed before it gets there. Too large and the model
+    # overshoots: it bounces across a narrow valley instead of settling into it,
+    # the loss oscillates, and the final weights are worse than where it started.
+    # The useful range is usually a small window, often 1-2 orders of magnitude.
+    # This is why nobody picks it by hand -- you try a few, or you schedule it.
+    #
+    # WHAT A PLATEAU IS
+    # Early in training the loss falls quickly, then the rate of improvement
+    # decays. Eventually the model has extracted most of what it can from the
+    # easy structure in the data, and the loss curve flattens into a plateau.
+    # Mathematically, gradients are still non-zero, but they are small and point
+    # in directions that mostly ramble rather than toward a clear minimum.
+    # A plateau is not a failure -- it means training has reached the point where
+    # a single fixed step size is too coarse to make the fine adjustments that
+    # remain.
+    #
+    # WHY REDUCING THE LR IMPROVES CONVERGENCE
+    # Near a minimum the loss surface is a narrow, curved valley, like a long
+    # ravine. A large step sends the gradient back and forth across the walls,
+    # bouncing from side to side while making slow progress along the floor. The
+    # weights end up somewhere along the floor rather than at its lowest point,
+    # and they keep bouncing there instead of settling.
+    #
+    # Halving or tenth-ing the step size fixes exactly that. The bouncing shrinks
+    # in proportion, so the model stops oscillating across the ravine and starts
+    # travelling along it, and the noise it settles into gets smaller too. It is
+    # the difference between throwing a ping-pong ball across a room and rolling
+    # it gently down a hill.
+    #
+    # In practice this is what gets you the last few percent of accuracy: coarse
+    # progress while the LR is high, then progressively finer settling as it
+    # drops. `lr_factor=0.1` with `lr_patience=2` is a common, reliable pairing
+    # for finetuning; `lr_factor=0.5` is a gentler alternative worth trying if
+    # 0.1 makes training look like it stalls out.
+    #
+    # `ReduceLROnPlateau` (rather than `StepLR` or `CosineAnnealingLR`) is the
+    # right choice here because it is *adaptive*: the schedule reacts to the
+    # metric instead of being computed from the epoch count, so the LR drops only
+    # when training has genuinely stopped improving, and never drops at all if
+    # progress continues. That also makes it robust to a dataset size you have
+    # to guess at.
+    #
+    # A note on the comparison it uses: torch decides "is this better" with a
+    # *relative* threshold, `value < best * (1 - 1e-4)`, not an absolute one.
+    # On a val loss of 0.4 that is a margin of 4e-5, so returning to exactly
+    # your previous best does not count as progress and does not reset the
+    # patience. The matching `EarlyStopping` below uses an absolute
+    # `min_delta`, which defaults to 0.0 and so is slightly more permissive.
+    # The two agree by default and diverge only if you set min_delta above 0.
+    #
+    # Two rules this scheduler imposes, both easy to get wrong:
+    #   1. `scheduler.step(metric)` needs a metric -- it cannot be called bare.
+    #   2. It must be fed the *validation* metric, after the validation pass.
+    #      Handing it the training loss would halve the LR every time the model
+    #      memorised a little harder, which is precisely backwards.
+    scheduler = (
+        torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",           # validation loss should go down
+            factor=cfg.lr_factor,  # multiply the LR by this on a plateau
+            patience=cfg.lr_patience,  # bad epochs tolerated before reducing
+            min_lr=cfg.min_lr,     # floor, so the LR cannot decay to zero
+        )
+        if cfg.use_lr_scheduler
+        else None
+    )
+    if scheduler is None:
+        logger.warning("LR scheduler disabled -- training at a constant %g", cfg.lr)
+
     criterion = build_criterion(cfg, data.train_labels, class_names, device)
 
     # One directory per experiment. `models/README.md` forbids overwriting
@@ -740,6 +847,41 @@ def train(cfg: TrainConfig) -> Path:
             show_progress=cfg.show_progress,
         )
 
+        # Scheduler first, then the early-stopping check. The order matters and
+        # is not arbitrary: a lowered LR often lets the validation loss improve
+        # again on the next epoch, which resets the early-stopping patience
+        # counter, so the two features cooperate rather than fight.
+        #
+        # Budget carefully, though. A reduction costs `lr_patience + 1` bad
+        # epochs (3 at the default), and early stopping fires after
+        # `early_stopping_patience` (5). So the shipped defaults buy
+        # `5 // 3 == 1` reduction before training halts -- one chance, not
+        # several. That is enough, but only because the LR also gets logged and
+        # the run continues at a lower step size if you raise
+        # `--early-stopping-patience`. If you want more reductions, raise the
+        # early-stopping patience; do not lower lr_patience below 1.
+        #
+        # The configuration to avoid is lr_patience >= early_stopping_patience,
+        # which starves the scheduler completely: it is still waiting for its
+        # own patience to elapse when early stopping has already ended the run,
+        # so it never reduces once. `--lr-patience 9` with the default
+        # early-stopping patience of 5 is exactly that, and it runs at a
+        # constant LR while appearing to be scheduled.
+        lr_before = optimizer.param_groups[0]["lr"]
+        if scheduler is not None:
+            # Fed the VALIDATION loss, after the validation pass, exactly once
+            # per epoch. `get_last_lr()[0]` is the LR that will be used from the
+            # next epoch onwards.
+            scheduler.step(val_metrics["loss"])
+        lr_after = optimizer.param_groups[0]["lr"]
+
+        if lr_after < lr_before:
+            logger.info(
+                "  learning rate reduced %.3g -> %.3g (validation loss plateaued "
+                "for %d epochs)",
+                lr_before, lr_after, cfg.lr_patience,
+            )
+
         # A new best validation loss: save the weights and reset the patience.
         improved = stopper.step(val_metrics["loss"], epoch)
 
@@ -749,6 +891,10 @@ def train(cfg: TrainConfig) -> Path:
             "train_acc": train_metrics["accuracy"],
             "val_loss": val_metrics["loss"],
             "val_acc": val_metrics["accuracy"],
+            # The LR actually used for THIS epoch, which is the one before any
+            # reduction this step. Logging lr_after here would retroactively
+            # mislabel every epoch that triggered a reduction.
+            "lr": lr_before,
             "seconds": round(time.time() - epoch_start, 1),
             "is_best": improved,
         }
@@ -757,8 +903,9 @@ def train(cfg: TrainConfig) -> Path:
             best_record = record
 
         logger.info(
-            "epoch %d/%d  train loss %.4f acc %.4f  |  val loss %.4f acc %.4f  |  %.1fs%s",
-            epoch, cfg.epochs,
+            "epoch %d/%d  lr %.2e  train loss %.4f acc %.4f  |  "
+            "val loss %.4f acc %.4f  |  %.1fs%s",
+            epoch, cfg.epochs, lr_before,
             train_metrics["loss"], train_metrics["accuracy"],
             val_metrics["loss"], val_metrics["accuracy"],
             record["seconds"],
@@ -843,6 +990,18 @@ def train(cfg: TrainConfig) -> Path:
                 "best_epoch_val_accuracy": best_record["val_acc"],
                 "epochs_run": len(history),
                 "stopped_early": stopper.should_stop,
+                "lr_schedule": {
+                    "enabled": cfg.use_lr_scheduler,
+                    "start_lr": cfg.lr,
+                    "min_lr": cfg.min_lr,
+                    "final_lr": (
+                        optimizer.param_groups[0]["lr"] if scheduler is not None
+                        else cfg.lr
+                    ),
+                    "reductions": sum(
+                        1 for a, b in zip(history, history[1:]) if b["lr"] < a["lr"]
+                    ),
+                },
                 "test": test_metrics,
                 "total_seconds": round(total_seconds, 1),
             },
@@ -898,6 +1057,17 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     parser.add_argument("--early-stopping-min-delta", type=float,
                         default=defaults.early_stopping_min_delta,
                         help="min val-loss decrease that counts as an improvement")
+    parser.add_argument("--no-lr-scheduler", dest="use_lr_scheduler",
+                        action="store_false", default=defaults.use_lr_scheduler,
+                        help="hold the learning rate constant for the whole run")
+    parser.add_argument("--lr-patience", type=int, default=defaults.lr_patience,
+                        help="bad epochs before the LR is reduced; keep this "
+                             "below --early-stopping-patience (default: %(default)s)")
+    parser.add_argument("--lr-factor", type=float, default=defaults.lr_factor,
+                        help="LR multiplier on a plateau, in (0,1); 0.1 = /10 "
+                             "(default: %(default)s)")
+    parser.add_argument("--min-lr", type=float, default=defaults.min_lr,
+                        help="floor for the learning rate (default: %(default)s)")
     parser.add_argument("--no-progress", dest="show_progress", action="store_false",
                         default=defaults.show_progress)
 
@@ -921,6 +1091,10 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
         class_weighted=args.class_weighted,
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
+        use_lr_scheduler=args.use_lr_scheduler,
+        lr_patience=args.lr_patience,
+        lr_factor=args.lr_factor,
+        min_lr=args.min_lr,
         show_progress=args.show_progress,
     )
     return cfg
