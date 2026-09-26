@@ -1,41 +1,53 @@
 # Brain Tumor MRI Classifier — dependencies
 # Install with:  python -m venv .venv && .venv\Scripts\activate
 #                pip install -r requirements.txt
-# Python 3.10+ required (3.11/3.12 recommended).
+#
+# Requires Python 3.12+ (verified on 3.13.15, win_amd64).
+# numpy 2.5.3 is the binding constraint: it requires Python >=3.12.
 
 # --- Core deep learning -------------------------------------------------
-# CPU-only install:  pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cpu
-torch==2.6.0
-torchvision==0.21.0
+# CPU-only install (recommended unless you have an NVIDIA GPU):
+#   pip install torch==2.14.0 torchvision==0.29.0 --index-url https://download.pytorch.org/whl/cpu
+# The CUDA build is the default from PyPI; the command above swaps to the
+# smaller CPU-only wheel index. Install these two FIRST, then the rest.
+# NOTE: torchvision pins an exact torch version. These two must stay paired.
+torch==2.14.0
+torchvision==0.29.0
 
 # --- Data handling ------------------------------------------------------
-numpy==1.26.4
-pandas==2.2.3
-scikit-learn==1.6.1
-Pillow==11.1.0
-# Medical formats (use when reading DICOM/NIfTI instead of JPEG/PNG)
-pydicom==3.0.1
-SimpleITK==2.4.1
+numpy==2.5.3
+pandas==3.0.6
+scikit-learn==1.9.1
+pillow==12.3.0
 
-# --- Augmentation (training-time only) ----------------------------------
-albumentations==2.0.5
+# --- Visualization ------------------------------------------------------
+matplotlib==3.11.2
 
-# --- Visualization, evaluation, tracking -------------------------------
-matplotlib==3.10.0
-seaborn==0.13.2
-tensorboard==2.18.0
-tqdm==4.67.1
-
-# --- Config, logging, reproducibility -----------------------------------
-PyYAML==6.0.2
-# python-dotenv==1.0.1  # uncomment if you keep secrets/tokens in a .env file
+# --- Progress tracking --------------------------------------------------
+tqdm==4.70.1
 
 # --- Application layer --------------------------------------------------
-streamlit==1.41.1
+streamlit==1.64.0
 
-# --- Optional: ONNX export for CPU inference ---------------------------
-# onnx==1.17.0
-# onnxruntime==1.20.1
-
-# --- Dev / QA (safe to install everywhere) ------------------------------
-pytest==8.3.4
+# --- Optional: not installed by default ---------------------------------
+# Uncomment when the corresponding work actually starts. Versions below are
+# the current releases and are all Python 3.13 compatible.
+#
+# Medical formats — use when reading DICOM/NIfTI instead of JPEG/PNG.
+# pydicom==3.0.2
+# SimpleITK==2.5.6
+#
+# Training-time augmentation.
+# albumentations==2.0.8
+#
+# Evaluation + training telemetry.
+# seaborn==0.13.2
+# tensorboard==2.21.0
+#
+# Config and tests.
+# PyYAML==6.0.3
+# pytest==9.1.1
+#
+# ONNX export for fast CPU inference.
+# onnx==1.20.0
+# onnxruntime==1.23.0
