@@ -46,6 +46,11 @@ Every image goes through the same pipeline, in this order:
   4. **Label.** The class name ("glioma") is turned into an integer (0, 1, 2,
      3) because neural networks predict class *indices*, not words.
 
+Those steps live in `transforms.py`, which also holds the augmented *training*
+pipeline (random flip / rotation / affine / colour jitter). This module only
+decides *which* pipeline a given split gets -- augmented for `train`,
+deterministic for `test`.
+
 A NOTE ON DATA LEAKAGE
 ----------------------
 Splitting by folder is fine while you are learning the mechanics. Before this
@@ -76,21 +81,22 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
+# The preprocessing pipelines live in transforms.py, which owns the constants too.
+# `build_transform` below is kept as an alias so existing notebooks that import it
+# from here keep working; new code should import the two explicit names.
+from .transforms import (
+    IMAGE_SIZE,
+    IMAGENET_MEAN,
+    IMAGENET_STD,
+    build_eval_transform,
+    build_train_transform,
+)
+
 # Library code must never call print() (see src/README.md) -- it goes through a
 # logger instead, so notebook output and training logs stay readable.
 logger = logging.getLogger(__name__)
 
 # --- Hyperparameters, kept in one place so src/config.py can take them over ---
-
-#: Side length of the square image fed to the model.
-IMAGE_SIZE: int = 224
-
-#: Per-channel mean of the ImageNet dataset. Our MRI scans are grayscales
-#: replicated to 3 channels, so the "average" image is just a gray pixel.
-IMAGENET_MEAN: tuple[float, float, float] = (0.485, 0.456, 0.406)
-
-#: Per-channel standard deviation of the ImageNet dataset.
-IMAGENET_STD: tuple[float, float, float] = (0.229, 0.224, 0.225)
 
 #: Which file suffixes count as images. Anything else in a class folder
 #: (e.g. a stray .txt or Thumbs.db on Windows) is ignored.
@@ -109,25 +115,13 @@ SPLITS: tuple[str, str] = ("train", "test")
 
 
 def build_transform(image_size: int = IMAGE_SIZE) -> transforms.Compose:
-    """Build the resize -> tensor -> normalize pipeline.
+    """Backwards-compatible alias for `build_eval_transform`.
 
-    `transforms.Compose` just means "run these steps one after another".
-    The same pipeline is used for training and testing on purpose: any random
-    augmentation would have to be added for training only (see the
-    `train=True` note in `build_dataloaders`).
+    The old name implied "the one pipeline"; there are now two. This alias always
+    returns the *deterministic* pipeline, which is what it used to return, so
+    nothing that relied on it changes behaviour.
     """
-    return transforms.Compose(
-        [
-            # Step 1: force every scan to the same size. `antialias` avoids the
-            # jagged edges you get when downsampling MRI detail.
-            transforms.Resize((image_size, image_size), antialias=True),
-            # Step 2: PIL image -> float32 tensor, scaled from 0-255 to 0.0-1.0,
-            # shaped [channels, height, width] (PyTorch puts channels first).
-            transforms.ToTensor(),
-            # Step 3: center the data and give it a standard spread of 1.
-            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-        ]
-    )
+    return build_eval_transform(image_size)
 
 
 def find_class_names(split_dir: Path) -> list[str]:
@@ -181,8 +175,10 @@ class BrainTumorDataset(Dataset):
                 them. This is what keeps label 0 meaning the same thing in both
                 splits -- if `test/` happened to be missing a class, reading it
                 independently would silently shift every later label.
-            transform: preprocessing pipeline. Defaults to
-                `build_transform()` when not supplied.
+            transform: preprocessing pipeline. Defaults to the deterministic
+                `build_eval_transform()` when not supplied. Pass
+                `build_train_transform()` to get random augmentation; the easiest
+                way to do that is `build_dataloaders(..., augment=True)`.
         """
         self.root = Path(root)
         self.split = split
@@ -197,7 +193,9 @@ class BrainTumorDataset(Dataset):
         self.class_to_idx = {name: i for i, name in enumerate(self.class_names)}
         self.idx_to_class = {i: name for name, i in self.class_to_idx.items()}
 
-        self.transform = transform if transform is not None else build_transform()
+        self.transform = (
+            transform if transform is not None else build_eval_transform()
+        )
         self.samples: list[tuple[Path, int]] = self._collect_samples()
 
         if not self.samples:
@@ -275,6 +273,7 @@ def build_dataloaders(
     batch_size: int = 32,
     num_workers: int = 0,
     image_size: int = IMAGE_SIZE,
+    augment: bool = True,
 ) -> tuple[DataLoader, DataLoader]:
     """Create the training and test DataLoaders.
 
@@ -287,6 +286,10 @@ def build_dataloaders(
             requires guarding your entry point with
             `if __name__ == "__main__":` or you will hit a multiprocessing error.
         image_size: side length for the resize step.
+        augment: apply random augmentation to the *training* split only. Leave
+            this True for normal training. Set it False to measure what the
+            augmentation is actually buying you -- the comparison needs an
+            identical eval pipeline either way, which it has.
 
     Returns:
         (train_loader, test_loader).
@@ -294,18 +297,25 @@ def build_dataloaders(
     if batch_size < 1:
         raise ValueError(f"batch_size must be >= 1, got {batch_size}")
 
+    # Two different pipelines. The test loader never sees a random transform,
+    # otherwise its score would move on every run and mean nothing.
+    train_transform = (
+        build_train_transform(image_size) if augment else build_eval_transform(image_size)
+    )
+    test_transform = build_eval_transform(image_size)
+
     # Read the class list once, from train/, and hand the identical mapping to
     # test so that label indices line up across both splits.
     train_dataset = BrainTumorDataset(
         root=root,
         split="train",
-        transform=build_transform(image_size),
+        transform=train_transform,
     )
     test_dataset = BrainTumorDataset(
         root=root,
         split="test",
         class_names=train_dataset.class_names,
-        transform=build_transform(image_size),
+        transform=test_transform,
     )
 
     # `shuffle=True` on train so the model cannot memorize scan order, e.g. by
@@ -327,11 +337,12 @@ def build_dataloaders(
     )
 
     logger.info(
-        "Dataloaders ready: %d train batches, %d test batches (batch_size=%d). "
-        "Train class counts: %s",
+        "Dataloaders ready: %d train batches, %d test batches (batch_size=%d, "
+        "augment=%s). Train class counts: %s",
         len(train_loader),
         len(test_loader),
         batch_size,
+        augment,
         train_dataset.label_counts(),
     )
     return train_loader, test_loader
