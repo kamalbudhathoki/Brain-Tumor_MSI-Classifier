@@ -15,7 +15,9 @@ The pipeline, in order:
                                              |
                                    train loop + val loop
                                              |
-                                        best.pt
+                              best.pt + metrics.json
+                                             |
+                          curves -> outputs/runs/<experiment>/
 
 THE VALIDATION SPLIT -- READ THIS FIRST
 ---------------------------------------
@@ -78,6 +80,7 @@ from .data.transforms import (
     build_train_transform,
 )
 from .models.classifier import ARCH_NAME, NUM_CLASSES, build_model
+from .plots import RUNS_SUBDIR, plot_training_curves
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +136,8 @@ class TrainConfig:
     # --- output ---
     output_root: Path = Path("models")
     run_name: str | None = None
+    plots_root: Path = Path("outputs")
+    save_plots: bool = True
 
     def validate(self) -> None:
         """Fail early and loudly on nonsense, before spending GPU hours."""
@@ -661,6 +666,13 @@ def save_checkpoint(
     "what image size, what normalisation, which classes, in which order", then
     inference has to guess -- and a wrong guess produces a confident, wrong
     prediction instead of an error.
+
+    `config` goes through JSON before it is stored. `asdict(cfg)` alone would pickle
+    the `Path` fields, and PyTorch's restricted unpickler refuses `WindowsPath`, so
+    the `weights_only=True` reload at the end of `train()` (and in
+    `src/evaluate.load_checkpoint`) raised UnpicklingError on its own output. Same
+    `default=str` the metrics.json dump below already uses; the paths come back as
+    strings, which is all anything reading them needs.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -678,7 +690,7 @@ def save_checkpoint(
             "epoch": epoch,
             "seed": cfg.seed,
             "metrics": metrics,
-            "config": asdict(cfg),
+            "config": json.loads(json.dumps(asdict(cfg), default=str)),
         },
         path,
     )
@@ -801,9 +813,18 @@ def train(cfg: TrainConfig) -> Path:
     # best.pt, because a run that improves on paper but overwrites the checkpoint
     # that produced your last reported number is a trap you cannot detect later.
     run_id = cfg.run_name or datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_dir = cfg.output_root / f"{cfg.arch}_{run_id}"
+    # The experiment's name, reused verbatim for the figures so a checkpoint and its
+    # curves are always found in sibling trees under the same label.
+    experiment = f"{cfg.arch}_{run_id}"
+
+    run_dir = cfg.output_root / experiment
     run_dir.mkdir(parents=True, exist_ok=True)
     logger.info("Run directory: %s", run_dir)
+
+    # Curves go to outputs/, not next to the weights. `models/` holds inputs that are
+    # expensive to reproduce; `outputs/` holds derived files that are not, and
+    # outputs/README.md says so explicitly.
+    plots_dir = cfg.plots_root / RUNS_SUBDIR / experiment
 
     best_path = run_dir / "best.pt"
     last_path = run_dir / "last.pt"
@@ -1010,6 +1031,24 @@ def train(cfg: TrainConfig) -> Path:
         encoding="utf-8",
     )
 
+    if cfg.save_plots:
+        # From the same `history` that metrics.json was just written from, so the
+        # figures and the JSON can never disagree. Best-effort: a plotting failure
+        # must not discard a run whose checkpoints are already on disk. Rebuild the
+        # curves from the file if this ever fires.
+        try:
+            plot_training_curves(history, plots_dir, subtitle=experiment, dpi=150)
+            logger.info("Training curves written to %s", plots_dir)
+        except Exception:  # noqa: BLE001 - see above: never fatal to the run
+            logger.exception(
+                "Could not render the training curves to %s. The run itself is "
+                "complete -- regenerate them with `python -m src.plots --metrics %s`.",
+                plots_dir,
+                run_dir / "metrics.json",
+            )
+    else:
+        logger.info("Plotting disabled -- no curves written to %s", plots_dir)
+
     logger.info("Done in %.1fs. Best checkpoint: %s", total_seconds, best_path)
     return best_path
 
@@ -1039,6 +1078,12 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     parser.add_argument("--output-root", type=Path, default=defaults.output_root)
     parser.add_argument("--run-name", type=str, default=defaults.run_name,
                         help="experiment folder name; defaults to a timestamp")
+    parser.add_argument("--plots-root", type=Path, default=defaults.plots_root,
+                        help="root for the loss/accuracy curves; the figures land in "
+                             "<root>/runs/<experiment>/ (default: %(default)s)")
+    parser.add_argument("--no-plots", dest="save_plots", action="store_false",
+                        default=defaults.save_plots,
+                        help="skip the training-curve figures")
     # The three boolean flags below pass `default=defaults.<field>` explicitly.
     # Without it argparse silently wins: `store_const` and `store_false` both
     # default to None/True, which would override whatever TrainConfig says and
@@ -1087,6 +1132,8 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
         device=args.device,
         output_root=args.output_root,
         run_name=args.run_name,
+        plots_root=args.plots_root,
+        save_plots=args.save_plots,
         augment=args.augment,
         class_weighted=args.class_weighted,
         early_stopping_patience=args.early_stopping_patience,

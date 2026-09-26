@@ -12,7 +12,10 @@ outputs/
 │   ├── train.log              # stdout + logger output
 │   ├── metrics.csv            # per-epoch train/val loss and metrics
 │   ├── metrics.json           # best + final metrics summary
-│   ├── curves.png             # loss / accuracy curves
+│   ├── train_loss.png         # training loss per epoch
+│   ├── val_loss.png           # validation loss per epoch (best epoch marked)
+│   ├── train_accuracy.png     # training accuracy per epoch
+│   ├── val_accuracy.png       # validation accuracy per epoch (best epoch marked)
 │   └── confusion_matrix.png
 ├── predictions/               # per-image prediction CSVs for later analysis
 ├── figures/                   # EDA plots, Grad-CAM heatmaps, paper-quality charts
@@ -24,3 +27,6 @@ outputs/
 - Every directory name is the experiment name plus a short git SHA, e.g.
   `resnet50_a7f3c1d/`, so parallel experiments never overwrite each other.
 - Never read anything from `outputs/` at inference time — it is not an input surface.
+- Everything here regenerates. `src/train.py` writes the four curves at the end of
+  every run; `python -m src.plots --metrics models/<run>/metrics.json` rebuilds them
+  for an older run without retraining.
