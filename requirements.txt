@@ -1,0 +1,41 @@
+# Brain Tumor MRI Classifier — dependencies
+# Install with:  python -m venv .venv && .venv\Scripts\activate
+#                pip install -r requirements.txt
+# Python 3.10+ required (3.11/3.12 recommended).
+
+# --- Core deep learning -------------------------------------------------
+# CPU-only install:  pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cpu
+torch==2.6.0
+torchvision==0.21.0
+
+# --- Data handling ------------------------------------------------------
+numpy==1.26.4
+pandas==2.2.3
+scikit-learn==1.6.1
+Pillow==11.1.0
+# Medical formats (use when reading DICOM/NIfTI instead of JPEG/PNG)
+pydicom==3.0.1
+SimpleITK==2.4.1
+
+# --- Augmentation (training-time only) ----------------------------------
+albumentations==2.0.5
+
+# --- Visualization, evaluation, tracking -------------------------------
+matplotlib==3.10.0
+seaborn==0.13.2
+tensorboard==2.18.0
+tqdm==4.67.1
+
+# --- Config, logging, reproducibility -----------------------------------
+PyYAML==6.0.2
+# python-dotenv==1.0.1  # uncomment if you keep secrets/tokens in a .env file
+
+# --- Application layer --------------------------------------------------
+streamlit==1.41.1
+
+# --- Optional: ONNX export for CPU inference ---------------------------
+# onnx==1.17.0
+# onnxruntime==1.20.1
+
+# --- Dev / QA (safe to install everywhere) ------------------------------
+pytest==8.3.4

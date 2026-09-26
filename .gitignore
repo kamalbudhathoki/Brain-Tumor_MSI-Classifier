@@ -1,0 +1,85 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging / build
+build/
+dist/
+sdist/
+wheels/
+*.egg-info/
+*.egg
+.installed.cfg
+pip-wheel-metadata/
+
+# Testing / type checking / linting caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+dmypy.json
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# Jupyter
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# --- Project data (large, license-restricted) ---------------------------
+# Keep the folder structure, never the contents.
+data/raw/*
+data/interim/*
+data/processed/
+data/splits/
+!data/**/README.md
+!data/**/.gitkeep
+
+# --- Model artifacts (large binaries) -----------------------------------
+models/*
+!models/README.md
+!models/.gitkeep
+!models/registry.json
+
+# --- Derived run outputs (regenerable) ----------------------------------
+outputs/*
+!outputs/README.md
+!outputs/.gitkeep
+
+# Logs
+*.log
+logs/
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Exported/committed-adjacent noise
+*.onnx
+*.engine
+*.mlmodel
