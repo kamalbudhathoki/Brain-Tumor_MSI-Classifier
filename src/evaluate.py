@@ -544,6 +544,36 @@ def _as_float_list(value: object) -> list[float] | None:
         return None
 
 
+def list_checkpoints(root: str | Path = "models") -> list[Path]:
+    """Every `best.pt` under `root`, oldest first.
+
+    The listing half of `find_checkpoint`, split out because a UI needs the whole
+    set -- to offer a picker -- while a CLI needs one of them. Keeping the glob
+    here means the `models/<run>/best.pt` layout is described in exactly one
+    place, so the two cannot disagree about where checkpoints live.
+
+    Returns an empty list rather than raising when `root` is missing or holds no
+    checkpoints: "there is nothing to choose from yet" is a state a UI renders,
+    not an exception. `find_checkpoint` turns it back into an exception for the
+    CLI, where having no default really is an error.
+
+    Returns:
+        Paths sorted by modification time, so the last element is the newest --
+        the same ordering `find_checkpoint` picks its default from.
+    """
+    root = Path(root)
+    if not root.is_dir():
+        return []
+    try:
+        candidates = sorted(root.glob("*/best.pt"), key=lambda p: p.stat().st_mtime)
+    except OSError:
+        # An unreadable directory (permissions, a file where a dir is expected)
+        # is "no checkpoints available", not a crash: the UI has an empty state
+        # for exactly this.
+        return []
+    return candidates
+
+
 def find_checkpoint(root: str | Path = "models") -> Path:
     """Return the most recently modified `best.pt` under `root`.
 
@@ -561,7 +591,7 @@ def find_checkpoint(root: str | Path = "models") -> Path:
             "`python -m src.train`, or pass --checkpoint explicitly."
         )
 
-    candidates = sorted(root.glob("*/best.pt"), key=lambda p: p.stat().st_mtime)
+    candidates = list_checkpoints(root)
     if not candidates:
         raise FileNotFoundError(
             f"No 'best.pt' under {root}. Expected models/<run>/best.pt, written by "
