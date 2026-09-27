@@ -405,6 +405,14 @@ class CheckpointInfo:
     epoch: int | None = None
     train_metrics: dict[str, float] = field(default_factory=dict)
     config: dict[str, object] = field(default_factory=dict)
+    #: Normalisation the checkpoint was trained with, read from its `norm_mean` /
+    #: `norm_std` keys. `None` when the checkpoint omits them, which is different
+    #: from a recorded value that happens to equal the current
+    #: `transforms.IMAGENET_MEAN` -- the first means "unknown", the second means
+    #: "known and it agrees". `src/inference.py` needs the distinction in order to
+    #: say which of the two it is looking at.
+    norm_mean: list[float] | None = None
+    norm_std: list[float] | None = None
 
 
 def load_checkpoint(
@@ -511,8 +519,29 @@ def load_checkpoint(
         epoch=checkpoint.get("epoch"),
         train_metrics=dict(checkpoint.get("metrics", {}) or {}),
         config=dict(checkpoint.get("config", {}) or {}),
+        # Kept as lists of floats, or None when absent. `save_checkpoint` writes
+        # these, so a checkpoint from this project has them; an older one may not.
+        norm_mean=_as_float_list(checkpoint.get("norm_mean")),
+        norm_std=_as_float_list(checkpoint.get("norm_std")),
     )
     return model, info
+
+
+def _as_float_list(value: object) -> list[float] | None:
+    """Coerce a checkpoint's normalisation constants to floats, or None if absent.
+
+    Deliberately not `list(value)`: a checkpoint that stored the wrong type for
+    `norm_mean` would then raise here, inside checkpoint loading, over a field
+    that only exists so a *warning* could be issued downstream. Returning None for
+    anything unusable keeps a malformed-but-loadable checkpoint loadable, and puts
+    the problem where it can be reported.
+    """
+    if value is None:
+        return None
+    try:
+        return [float(item) for item in value]  # type: ignore[union-attr]
+    except (TypeError, ValueError):
+        return None
 
 
 def find_checkpoint(root: str | Path = "models") -> Path:
