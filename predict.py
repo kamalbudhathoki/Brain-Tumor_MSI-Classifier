@@ -89,6 +89,7 @@ import logging
 import sys
 from pathlib import Path
 
+from src.evaluate import find_checkpoint
 from src.inference import format_report, predict_file
 
 #: Diagnostics go to stderr through the logger, so stdout carries the report and
@@ -210,10 +211,22 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    # Resolved here rather than left to predict_file's own default, so the report
+    # and the JSON name the file that was actually loaded. Left implicit, the
+    # header would read "checkpoint  (none)" and the JSON "checkpoint": null
+    # while a specific best.pt was in use -- which is the kind of missing
+    # provenance this project's conventions are specifically about. Same call
+    # either way, so the model loaded is unchanged.
+    try:
+        checkpoint = args.checkpoint if args.checkpoint is not None else find_checkpoint()
+    except FileNotFoundError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
     try:
         prediction = predict_file(
             args.image,
-            checkpoint=args.checkpoint,
+            checkpoint=checkpoint,
             device=args.device,
             image_size=args.image_size,
         )
@@ -229,14 +242,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.as_json:
         payload = prediction.to_dict()
         payload["image"] = str(args.image)
-        payload["checkpoint"] = str(args.checkpoint) if args.checkpoint else None
+        payload["checkpoint"] = str(checkpoint)
         print(json.dumps(payload, indent=2))
     else:
         print(
             format_report(
                 prediction,
                 image=args.image,
-                checkpoint=args.checkpoint,
+                checkpoint=checkpoint,
                 show_all=not args.brief,
             )
         )
