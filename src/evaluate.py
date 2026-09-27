@@ -1099,7 +1099,7 @@ def _pyplot() -> ModuleType:
     return _PYPLOT
 
 
-def _display_label(name: str) -> str:
+def display_label(name: str) -> str:
     """`no_tumor` -> `No Tumor`, for the axis ticks and the caption.
 
     Presentation only; the underlying class names are never rewritten, because
@@ -1109,6 +1109,12 @@ def _display_label(name: str) -> str:
     rather than four identifiers. Only the first letter of each word is touched,
     so an acronym like `MRI` survives intact where `str.title()` would mangle it
     into `Mri`.
+
+    Public rather than private because all three renderers need it -- the confusion
+    figure here, `src/inference.py`'s report, and `app.py` -- and a second copy of
+    it would be one more place for the four class names to be spelled differently.
+    The import graph runs `inference -> evaluate`, so this is the end of the
+    chain; `inference` re-exports it rather than the other way round.
     """
     words = name.replace("_", " ").replace("-", " ").split()
     return " ".join(word[:1].upper() + word[1:] for word in words)
@@ -1403,7 +1409,7 @@ def _draw_confusion_figure(
             "no labels to put on the axes."
         )
 
-    labels = [_display_label(name) for name in metrics.class_names]
+    labels = [display_label(name) for name in metrics.class_names]
     columns = max(1, len(panels))
 
     # Everything below is sized in inches rather than as a fraction of the figure,

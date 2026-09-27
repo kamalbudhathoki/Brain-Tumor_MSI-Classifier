@@ -117,8 +117,19 @@ from .data.transforms import (
     IMAGENET_STD,
     build_eval_transform,
 )
-from .evaluate import CheckpointInfo, find_checkpoint, load_checkpoint
+from .evaluate import (
+    CheckpointInfo,
+    display_label,
+    find_checkpoint,
+    load_checkpoint,
+)
 from .train import resolve_device
+
+# `display_label` is imported, not defined, here. It lives in `evaluate` because
+# that module already needs it for the confusion figure, and the import graph runs
+# `inference -> evaluate`; re-exporting keeps `predict.py` and `app.py` reading
+# `from src.inference import display_label` -- the name belongs with the prediction
+# they are formatting -- without a second implementation to drift.
 
 # Library code must never call print() (see src/README.md) -- a Prediction is
 # returned to the caller, and `format_report` builds a string it can print, log, or
@@ -611,25 +622,6 @@ def predict_files(
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
-
-
-def display_label(name: str) -> str:
-    """`no_tumor` -> `No Tumor`, for presenting a class name to a reader.
-
-    Presentation only. The `Prediction` keeps the checkpoint's own spelling,
-    since that is the key its probabilities are indexed by; this is only ever
-    used at the point of display, in a report or a UI.
-
-    Public rather than private because both entry points need it -- `predict.py`
-    and `app.py` each render the class name -- and a third copy of it would be
-    one more place for the four class names to be spelled differently.
-
-    Underscores and hyphens become spaces and each word is title-cased. Only the
-    first letter of each word is touched, so an acronym like `MRI` survives intact
-    where `str.title()` would mangle it into `Mri`.
-    """
-    words = name.replace("_", " ").replace("-", " ").split()
-    return " ".join(word[:1].upper() + word[1:] for word in words)
 
 
 def _bar(fraction: float, width: int = BAR_WIDTH) -> str:

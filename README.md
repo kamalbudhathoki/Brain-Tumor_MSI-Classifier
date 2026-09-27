@@ -80,9 +80,12 @@ the top of `requirements.txt`).
    checkpointing, TensorBoard logging, deterministic seeding.
 5. **Evaluation** — accuracy, macro precision/recall/F1, per-class ROC-AUC, confusion
    matrix, and error analysis on the held-out test set.
-6. **Inference** — `src/inference.py` returns label + probabilities; Grad-CAM
-   heatmaps for explainability; single scan and batch modes.
-7. **Application** — fill in `app.py` on top of `src/inference.py`.
+6. **Inference** — `src/inference.py` returns label + probabilities; single scan is
+   done and shared by `predict.py` and `app.py`. Still to do: Grad-CAM heatmaps for
+   explainability, and a batch mode.
+7. **Application** — `app.py` is done: upload one scan, get the predicted class,
+   confidence, and the full class distribution, with the checkpoint's own
+   preprocessing applied automatically.
 8. **Hardening** — tests, ONNX export, containerization, model card.
 
 ---
