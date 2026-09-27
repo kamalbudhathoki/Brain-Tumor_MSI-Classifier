@@ -613,22 +613,20 @@ def predict_files(
 # ---------------------------------------------------------------------------
 
 
-def _display_label(name: str) -> str:
-    """`no_tumor` -> `No Tumor`, for the printed report.
+def display_label(name: str) -> str:
+    """`no_tumor` -> `No Tumor`, for presenting a class name to a reader.
 
-    Deliberately a copy of the identical helper in `src/evaluate.py` rather than
-    an import of its `_`-prefixed twin. Two reasons, in order:
+    Presentation only. The `Prediction` keeps the checkpoint's own spelling,
+    since that is the key its probabilities are indexed by; this is only ever
+    used at the point of display, in a report or a UI.
 
-      1. `src/evaluate.py` marks it private to that module, and reaching into
-         another module's private names is how a later rename of `evaluate`'s
-         internals silently breaks the CLI.
-      2. The seven lines are trivial and have no dependencies. If the two ever
-         disagree, the class names are still the same -- only the capitalisation
-         of a report differs -- so the cost of duplication is bounded and
-         visible, and the cost of coupling is not.
+    Public rather than private because both entry points need it -- `predict.py`
+    and `app.py` each render the class name -- and a third copy of it would be
+    one more place for the four class names to be spelled differently.
 
-    Presentation only. The `Prediction` keeps the checkpoint's own spelling, since
-    that is the key its probabilities are indexed by.
+    Underscores and hyphens become spaces and each word is title-cased. Only the
+    first letter of each word is touched, so an acronym like `MRI` survives intact
+    where `str.title()` would mangle it into `Mri`.
     """
     words = name.replace("_", " ").replace("-", " ").split()
     return " ".join(word[:1].upper() + word[1:] for word in words)
@@ -702,14 +700,14 @@ def format_report(
         lines.append("")
 
     # --- the two numbers the caller asked for ------------------------------
-    lines.append(f"  Predicted class   {_display_label(prediction.label)}")
+    lines.append(f"  Predicted class   {display_label(prediction.label)}")
     lines.append(f"  Confidence        {prediction.confidence:.2%}")
     lines.append("")
 
     runner_up = prediction.runner_up
     if runner_up is not None:
         lines.append(
-            f"  Next candidate    {_display_label(runner_up[0])} at "
+            f"  Next candidate    {display_label(runner_up[0])} at "
             f"{runner_up[1]:.2%}  (margin {prediction.margin:.2%})"
         )
         lines.append("")
@@ -725,10 +723,10 @@ def format_report(
     ordered = sorted(
         prediction.probabilities.items(), key=lambda item: item[1], reverse=True
     )
-    label_width = max((len(_display_label(name)) for name, _ in ordered), default=0)
+    label_width = max((len(display_label(name)) for name, _ in ordered), default=0)
 
     for name, probability in ordered:
-        display = _display_label(name)
+        display = display_label(name)
         # The winner is flagged with a "*" so the eye lands on it while scanning;
         # the ordering alone would otherwise have to be trusted for that.
         marker = "*" if name == prediction.label else " "
