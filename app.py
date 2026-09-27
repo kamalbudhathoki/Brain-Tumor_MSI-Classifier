@@ -181,6 +181,7 @@ from typing import Any, Mapping, NamedTuple, Sequence
 
 import streamlit as st
 import torch
+from PIL import Image, UnidentifiedImageError
 from torch import nn
 
 from src.data.dataset import IMAGE_EXTENSIONS
@@ -241,14 +242,32 @@ CLEAR_KEY_BODY = "clear_history_body"
 #: reflow. `st.get_option("theme.base")` is deliberately not consulted -- the
 #: light and dark themes do not change the layout, and a dark-mode branch here
 #: would be one more thing to keep in sync.
+#:
+#: Substituted into `STYLESHEET` rather than typed into it, so the number the CSS
+#: uses and the number documented above cannot drift apart.
 WIDE_LAYOUT_BREAKPOINT = 640
 
-#: Class put on the scan's image so the stylesheet can cap its height. The scan
-#: is portrait-shaped often enough that a full-height render pushes the
-#: prediction it is meant to explain below the fold.
-SCAN_IMAGE_CLASS = "scan-image"
+#: `st.container(key=...)` puts an `st-key-<key>` class on the container's DOM
+#: element, which is the one supported way for a stylesheet to target a specific
+#: piece of this page instead of every element of its kind. The scan is the only
+#: image the app shows, so this is belt-and-braces -- but a selector scoped to
+#: this container cannot accidentally catch a future one.
+SCAN_CONTAINER_KEY = "scan"
 
 logger = logging.getLogger(__name__)
+
+
+#: Attached under the history in both its states, including the empty one, because
+#: the scope of the list is the thing a reader is most likely to over-read: a
+#: table of predictions is exactly what a log of diagnoses looks like. Defined
+#: next to the other page-wide strings rather than beside `render_history`,
+#: because `render_sidebar_session` says a shorter version of the same thing.
+SCOPE_NOTE = (
+    "Session-only. These predictions are not written to disk and are gone when "
+    "this tab closes; nothing here is a record of a patient, and a row is only "
+    "as good as the scan it came from. There is deliberately no average "
+    "confidence: an average over a set of scans says nothing about any of them."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +329,153 @@ def _available_devices() -> list[str]:
 # Styling
 # ---------------------------------------------------------------------------
 
+#: The page's stylesheet, with `@breakpoint@` standing in for
+#: `WIDE_LAYOUT_BREAKPOINT`. A plain string rather than an f-string because CSS is
+#: almost entirely braces, and doubling every one of them to satisfy `str.format`
+#: would make the sheet harder to edit than the single `.replace()` is.
+STYLESHEET = """
+<style>
+    /* -- page ------------------------------------------------------ */
+    /* The default measure is too narrow for a side-by-side scan and
+       prediction; the page layout is already "wide". Generous bottom
+       padding so the last section is not flush against the viewport
+       edge. */
+    .block-container {
+        padding-top: 2.4rem;
+        padding-bottom: 4rem;
+        max-width: 1500px;
+    }
+
+    /* -- headings -------------------------------------------------- */
+    /* Streamlit sets heading margins in JavaScript, so the section rhythm
+       is a class on an <h3> rendered by `_section` instead. The element
+       selector is scoped to the block container so the sidebar's own
+       markdown headings pick up the tracking without losing their
+       spacing. */
+    .block-container h3 {
+        letter-spacing: -0.015em;
+        margin-top: 0;
+        margin-bottom: 0.15rem;
+    }
+    .section-subtitle {
+        color: rgba(135, 135, 135, 1);
+        font-size: 0.9rem;
+        margin: 0 0 0.9rem 0;
+        line-height: 1.45;
+    }
+
+    /* -- sections -------------------------------------------------- */
+    /* One rule for the gap under every top-level block, rather than a
+       per-widget margin. `st.container(gap=...)` handles the inside of a
+       card; this handles between cards, where no widget is involved and
+       the default is whatever the theme felt like. */
+    [data-testid="stVerticalBlock"] > [data-testid="stElementContainer"] {
+        margin-bottom: 1.15rem;
+    }
+    [data-testid="stVerticalBlock"] {
+        gap: 0.15rem;
+    }
+
+    /* -- metrics --------------------------------------------------- */
+    /* Metrics hold the headline numbers, so give them presence. The
+       default has no border; a soft one separates them from the page
+       without needing a container wrapped round each. `border=True` on
+       st.metric is the native equivalent and is used as well, so the
+       cards survive this rule being dropped. */
+    [data-testid="stMetric"] {
+        border: 1px solid rgba(128, 128, 128, 0.25);
+        border-radius: 0.6rem;
+        padding: 0.7rem 0.9rem 0.6rem 0.9rem;
+    }
+    [data-testid="stMetricLabel"] {
+        font-size: 0.78rem;
+        letter-spacing: 0.01em;
+        opacity: 0.7;
+    }
+    [data-testid="stMetricValue"] {
+        font-size: 1.7rem;
+        font-weight: 650;
+        font-variant-numeric: tabular-nums;
+    }
+    /* The delta line is used as a caption on a few cards ("2,052
+       trainable"), so it is set at caption size rather than as a change
+       indicator. */
+    [data-testid="stMetricDelta"] {
+        font-size: 0.78rem;
+    }
+
+    /* -- the scan -------------------------------------------------- */
+    /* A portrait slice rendered at full column height is tall enough to
+       push the prediction it explains below the fold. The class comes
+       from st.container(key=SCAN_CONTAINER_KEY); `object-fit` keeps the
+       aspect ratio rather than stretching it. */
+    .st-key-scan img {
+        max-height: 460px;
+        width: 100%;
+        object-fit: contain;
+        background: rgba(128, 128, 128, 0.06);
+        border-radius: 0.5rem;
+    }
+    [data-testid="stImageCaption"] {
+        font-size: 0.78rem;
+    }
+
+    /* -- progress bars --------------------------------------------- */
+    /* The bars carry the per-class text; tighten the stack so four of
+       them read as one list instead of four separate widgets. (The old
+       `stProgressText` rule went when the testid did; the percentage is
+       inside the bar, not in a separate element to size.) */
+    [data-testid="stProgress"] { margin-bottom: 0.1rem; }
+    [data-testid="stProgressBarTrack"] { padding: 0.1rem 0; }
+
+    /* -- rules ----------------------------------------------------- */
+    /* `hr` rather than a testid: st.divider() has carried a different one
+       across Streamlit versions, and a plain element selector is the only
+       one that has not. */
+    hr {
+        margin: 1.2rem 0;
+        border: 0;
+        border-top: 1px solid rgba(128, 128, 128, 0.25);
+    }
+
+    /* -- fact tables ----------------------------------------------- */
+    /* The key/value lists in the sidebar and in the model card. A grid
+       rather than a <table> so the key column sizes to the longest label
+       and the value column takes what is left, wrapping instead of
+       overflowing on a narrow sidebar. */
+    .facts {
+        display: grid;
+        grid-template-columns: max-content minmax(0, 1fr);
+        column-gap: 0.75rem;
+        row-gap: 0.2rem;
+        font-size: 0.82rem;
+        align-items: baseline;
+    }
+    .facts dt { opacity: 0.65; white-space: nowrap; }
+    .facts dd {
+        margin: 0;
+        font-variant-numeric: tabular-nums;
+        overflow-wrap: anywhere;
+    }
+
+    /* -- narrow viewports ------------------------------------------ */
+    /* Streamlit's own columns wrap at its `breakpoints.columns` theme
+       value; this only brings the type scale down to meet them, so the
+       page does not show desktop-sized headings above a single-column
+       stack. Everything structural above is already width-agnostic. */
+    @media (max-width: @breakpoint@px) {
+        .block-container {
+            padding-top: 1.4rem;
+            padding-bottom: 2.5rem;
+        }
+        [data-testid="stMetricValue"] { font-size: 1.4rem; }
+        [data-testid="stMetric"] { padding: 0.55rem 0.7rem 0.5rem 0.7rem; }
+        .section-subtitle { font-size: 0.85rem; }
+        .st-key-scan img { max-height: 320px; }
+    }
+</style>
+"""
+
 
 def inject_styles() -> None:
     """Apply the small stylesheet that makes the page read as one thing.
@@ -321,148 +487,7 @@ def inject_styles() -> None:
     correct, which is the only acceptable way for CSS in this project to fail.
     """
     st.markdown(
-        """
-        <style>
-            /* -- page ------------------------------------------------------ */
-            /* The default measure is too narrow for a side-by-side scan and
-               prediction; the page layout is already "wide". Generous bottom
-               padding so the last section is not flush against the viewport
-               edge. */
-            .block-container {
-                padding-top: 2.4rem;
-                padding-bottom: 4rem;
-                max-width: 1500px;
-            }
-
-            /* -- headings -------------------------------------------------- */
-            /* Streamlit sets heading margins in JavaScript, so the section
-               rhythm is a class on an <h3> rendered by `_section` instead. The
-               element selector is scoped to the block container so the sidebar's
-               own markdown headings pick up the tracking without losing their
-               spacing. */
-            .block-container h3 {
-                letter-spacing: -0.015em;
-                margin-top: 0;
-                margin-bottom: 0.15rem;
-            }
-            .section-subtitle {
-                color: rgba(135, 135, 135, 1);
-                font-size: 0.9rem;
-                margin: 0 0 0.9rem 0;
-                line-height: 1.45;
-            }
-
-            /* -- sections -------------------------------------------------- */
-            /* One rule for the gap under every top-level block, rather than a
-               per-widget margin. `st.container(gap=...)` handles the inside of
-               a card; this handles between cards, where no widget is involved
-               and the default is whatever the theme felt like. */
-            [data-testid="stVerticalBlock"] > [data-testid="stElementContainer"] {
-                margin-bottom: 1.15rem;
-            }
-            [data-testid="stVerticalBlock"] {
-                gap: 0.15rem;
-            }
-
-            /* -- metrics --------------------------------------------------- */
-            /* Metrics hold the headline numbers, so give them presence. The
-               default has no border; a soft one separates them from the page
-               without needing a container wrapped round each. `border=True` on
-               st.metric is the native equivalent and is used as well, so the
-               cards survive this rule being dropped. */
-            [data-testid="stMetric"] {
-                border: 1px solid rgba(128, 128, 128, 0.25);
-                border-radius: 0.6rem;
-                padding: 0.7rem 0.9rem 0.6rem 0.9rem;
-            }
-            [data-testid="stMetricLabel"] {
-                font-size: 0.78rem;
-                letter-spacing: 0.01em;
-                opacity: 0.7;
-            }
-            [data-testid="stMetricValue"] {
-                font-size: 1.7rem;
-                font-weight: 650;
-            }
-            /* The delta line is used as a caption on a few cards ("2,052
-               trainable"), so it is set at caption size rather than as a change
-               indicator. */
-            [data-testid="stMetricDelta"] {
-                font-size: 0.78rem;
-            }
-
-            /* -- the scan -------------------------------------------------- */
-            /* A portrait slice rendered at full column height is tall enough to
-               push the prediction it explains below the fold. The class is set
-               by `render_scan`; `object-fit` keeps the aspect ratio rather than
-               stretching it. */
-            .scan-image img {
-                max-height: 460px;
-                width: 100%;
-                object-fit: contain;
-                background: rgba(128, 128, 128, 0.06);
-                border-radius: 0.5rem;
-            }
-            [data-testid="stImageCaption"] {
-                font-size: 0.78rem;
-            }
-
-            /* -- progress bars --------------------------------------------- */
-            /* The bars carry the per-class text; tighten the stack so four of
-               them read as one list instead of four separate widgets. */
-            [data-testid="stProgress"] { margin-bottom: 0.1rem; }
-            [data-testid="stProgressBarTrack"] { padding: 0.1rem 0; }
-
-            /* -- rules ----------------------------------------------------- */
-            /* `hr` rather than a testid: st.divider() has carried a different one
-               across Streamlit versions, and a plain element selector is the only
-               one that has not. */
-            hr {
-                margin: 1.2rem 0;
-                border: 0;
-                border-top: 1px solid rgba(128, 128, 128, 0.25);
-            }
-
-            /* -- fact tables ----------------------------------------------- */
-            /* The key/value lists in the sidebar and in the model card. A grid
-               rather than a <table> so the key column sizes to the longest label
-               and the value column takes what is left, wrapping instead of
-               overflowing on a narrow sidebar. */
-            .facts {
-                display: grid;
-                grid-template-columns: max-content minmax(0, 1fr);
-                column-gap: 0.75rem;
-                row-gap: 0.2rem;
-                font-size: 0.82rem;
-                align-items: baseline;
-            }
-            .facts dt { opacity: 0.65; white-space: nowrap; }
-            .facts dd {
-                margin: 0;
-                font-variant-numeric: tabular-nums;
-                overflow-wrap: anywhere;
-            }
-
-            /* -- tabular figures ------------------------------------------- */
-            [data-testid="stMetricValue"] { font-variant-numeric: tabular-nums; }
-
-            /* -- narrow viewports ------------------------------------------ */
-            /* Streamlit's own columns wrap at its `breakpoints.columns` theme
-               value; this only brings the type scale down to meet them, so the
-               page does not show desktop-sized headings above a single-column
-               stack. Everything structural above is already width-agnostic. */
-            @media (max-width: 640px) {
-                .block-container {
-                    padding-top: 1.4rem;
-                    padding-bottom: 2.5rem;
-                }
-                [data-testid="stMetricValue"] { font-size: 1.4rem; }
-                [data-testid="stMetric"] { padding: 0.55rem 0.7rem 0.5rem 0.7rem; }
-                .section-subtitle { font-size: 0.85rem; }
-                .scan-image img { max-height: 320px; }
-            }
-        </style>
-        """,
+        STYLESHEET.replace("@breakpoint@", str(WIDE_LAYOUT_BREAKPOINT)),
         unsafe_allow_html=True,
     )
 
@@ -900,14 +925,41 @@ def render_waiting() -> None:
     )
 
 
+def upload_facts(data: bytes) -> str:
+    """A one-line description of what was actually uploaded: size, format, pixels.
+
+    Worth the two lines because it answers the question the resize raises. A
+    reader who sees the scan described as 512×512 and the result described as
+    "resized to 224×224" can see what the model was given; without it the resize
+    looks like a change to the image rather than a change to its size.
+
+    `Image.open` reads the header and stops -- the pixels are not decoded, and the
+    file is not rewritten -- so this costs a few hundred bytes of I/O. A failure
+    here is not a problem: the uploader already restricted the extension, and
+    `src/inference` reports a real decode failure properly, so the worst case is
+    a caption with the byte size alone.
+    """
+    size = f"{len(data) / 1024:.1f} KB"
+    try:
+        with Image.open(io.BytesIO(data)) as handle:
+            width, height = handle.size
+            image_format = handle.format
+    except (UnidentifiedImageError, OSError, ValueError):
+        return size
+    return f"{width}×{height} · {image_format} · {size}"
+
+
 def render_scan(data: bytes, name: str) -> None:
-    """Show the scan in the left column."""
+    """Show the scan in the left column, at its own size.
+
+    The `key` is what the stylesheet's `.st-key-scan` selector hangs off, and
+    nothing else: the height cap on the image is the reason this container
+    exists rather than a bare `st.image`.
+    """
     st.markdown("### Scan")
-    st.image(data, caption=name, width="stretch")
-    st.markdown(
-        f'<div class="{SCAN_IMAGE_CLASS}"></div>',
-        unsafe_allow_html=True,
-    )
+    with st.container(key=SCAN_CONTAINER_KEY):
+        st.image(data, caption=name, width="stretch")
+    st.caption(upload_facts(data))
 
 
 # ---------------------------------------------------------------------------
@@ -1511,10 +1563,13 @@ def render_history() -> None:
                 "here, so the same scan can be compared against the last few "
                 "without re-running the model."
             )
-            st.caption(_SCOPE_NOTE)
+            st.caption(SCOPE_NOTE)
             return
 
-        top = st.columns([1, 1, 1, 1], gap="medium")
+        # `vertical_alignment="bottom"` so the clear button sits on the same line
+        # as the bottom of the metric cards rather than floating at the top of a
+        # taller cell.
+        top = st.columns([1, 1, 1, 1], gap="medium", vertical_alignment="bottom")
         with top[0]:
             st.metric("Scans this session", str(state.total), border=True)
         with top[1]:
@@ -1620,18 +1675,7 @@ def render_history() -> None:
             help="The rows above, oldest first, with the full per-class "
             "distribution and the checkpoint each came from.",
         )
-        st.caption(_SCOPE_NOTE)
-
-
-#: Attached under the history in both its states, including the empty one, because
-#: the scope of the list is the thing a reader is most likely to over-read: a
-#: table of predictions is exactly what a log of diagnoses looks like.
-_SCOPE_NOTE = (
-    "Session-only. These predictions are not written to disk and are gone when "
-    "this tab closes; nothing here is a record of a patient, and a row is only "
-    "as good as the scan it came from. There is deliberately no average "
-    "confidence: an average over a set of scans says nothing about any of them."
-)
+        st.caption(SCOPE_NOTE)
 
 
 def _table_height(rows: int) -> int:
@@ -1700,11 +1744,11 @@ def render_result(
     in a column that had been laid out for an image; here a failure is a message
     in the flow of the page and no half-drawn layout is left behind.
 
-    The history is recorded before anything is drawn, so a reader who screenshots
-    the result and then clears the list still has the row in the CSV... which
-    they do not, actually -- clearing discards it. What recording first does buy
-    is that the history and the result on screen can never disagree, because they
-    come from the same call rather than from two.
+    The history is recorded from the same `Prediction` that the panel below draws,
+    immediately before the panel is built. Recording it after the render would
+    work just as well and was the previous order, but keeping the two adjacent
+    means there is one place where a result becomes a row, so the table and the
+    result on screen cannot come from two different calls.
     """
     data = uploaded.getvalue()
     name = uploaded.name
