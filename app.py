@@ -295,10 +295,22 @@ def _load_model(
         (model, info, device) -- everything `predict_image` needs, plus the device
         the model was placed on.
 
+    Raises:
+        Exception: whatever reading the checkpoint raises, deliberately unwrapped.
+            The file lives in `models/`, so it is a file the user put there, and
+            what a bad one raises depends on how it is bad: a truncated archive
+        raises from `pickle`, a `state_dict` that no longer fits its architecture
+            raises from `torch.nn`, an unexpected dtype raises from `torch.load`.
+            `main` reports all of them the same way, and this function has nothing
+            useful to add to the message.
+
     The returned model is shared mutable state. Nothing here mutates it: it is
     already in `eval()` mode from `load_checkpoint`, and `predict_tensor` calls
     `model.eval()` again defensively, so one session cannot put the shared model
     into training mode out from under another.
+
+    An exception is not cached, so fixing or deleting the file and rerunning the
+    app is enough to recover; there is no poisoned cache entry to clear.
     """
     device = resolve_device(device_spec)
     model, info = load_checkpoint(Path(checkpoint), device)
@@ -365,15 +377,23 @@ STYLESHEET = """
     }
 
     /* -- sections -------------------------------------------------- */
-    /* One rule for the gap under every top-level block, rather than a
-       per-widget margin. `st.container(gap=...)` handles the inside of a
-       card; this handles between cards, where no widget is involved and
-       the default is whatever the theme felt like. */
-    [data-testid="stVerticalBlock"] > [data-testid="stElementContainer"] {
-        margin-bottom: 1.15rem;
-    }
-    [data-testid="stVerticalBlock"] {
-        gap: 0.15rem;
+    /* Space between the page's top-level sections, which no widget owns:
+       `st.container(gap=...)` only knows about the inside of a card. Scoped
+       to the main block container's direct children, and to all but the last
+       of them, so it adds a rhythm between sections without also inflating
+       the gap inside every bordered card.
+
+       Note the `.block-container ` prefix on every framework selector below.
+       Streamlit styles its components with emotion, i.e. with a generated
+       single class, so a bare `[data-testid="x"]` rule and an emotion rule
+       have *equal* specificity and the winner is decided by which one the
+       browser happens to see last. Prefixing with a class makes these rules
+       win deterministically, which matters more than it sounds: the same
+       prefixing is what stops a decoration here from quietly becoming a
+       layout bug after an upgrade moves the style tags around. */
+    .block-container > [data-testid="stVerticalBlock"]
+        > [data-testid="stElementContainer"]:not(:last-child) {
+        margin-bottom: 1.4rem;
     }
 
     /* -- metrics --------------------------------------------------- */
@@ -382,17 +402,17 @@ STYLESHEET = """
        without needing a container wrapped round each. `border=True` on
        st.metric is the native equivalent and is used as well, so the
        cards survive this rule being dropped. */
-    [data-testid="stMetric"] {
+    .block-container [data-testid="stMetric"] {
         border: 1px solid rgba(128, 128, 128, 0.25);
         border-radius: 0.6rem;
         padding: 0.7rem 0.9rem 0.6rem 0.9rem;
     }
-    [data-testid="stMetricLabel"] {
+    .block-container [data-testid="stMetricLabel"] {
         font-size: 0.78rem;
         letter-spacing: 0.01em;
         opacity: 0.7;
     }
-    [data-testid="stMetricValue"] {
+    .block-container [data-testid="stMetricValue"] {
         font-size: 1.7rem;
         font-weight: 650;
         font-variant-numeric: tabular-nums;
@@ -400,7 +420,7 @@ STYLESHEET = """
     /* The delta line is used as a caption on a few cards ("2,052
        trainable"), so it is set at caption size rather than as a change
        indicator. */
-    [data-testid="stMetricDelta"] {
+    .block-container [data-testid="stMetricDelta"] {
         font-size: 0.78rem;
     }
 
@@ -416,7 +436,7 @@ STYLESHEET = """
         background: rgba(128, 128, 128, 0.06);
         border-radius: 0.5rem;
     }
-    [data-testid="stImageCaption"] {
+    .block-container [data-testid="stImageCaption"] {
         font-size: 0.78rem;
     }
 
@@ -425,14 +445,15 @@ STYLESHEET = """
        them read as one list instead of four separate widgets. (The old
        `stProgressText` rule went when the testid did; the percentage is
        inside the bar, not in a separate element to size.) */
-    [data-testid="stProgress"] { margin-bottom: 0.1rem; }
-    [data-testid="stProgressBarTrack"] { padding: 0.1rem 0; }
+    .block-container [data-testid="stProgress"] { margin-bottom: 0.1rem; }
+    .block-container [data-testid="stProgressBarTrack"] { padding: 0.1rem 0; }
 
     /* -- rules ----------------------------------------------------- */
     /* `hr` rather than a testid: st.divider() has carried a different one
        across Streamlit versions, and a plain element selector is the only
-       one that has not. */
-    hr {
+       one that has not. Best-effort -- if Streamlit's own divider margins
+       win, the rule is simply ignored. */
+    .block-container hr {
         margin: 1.2rem 0;
         border: 0;
         border-top: 1px solid rgba(128, 128, 128, 0.25);
@@ -468,8 +489,10 @@ STYLESHEET = """
             padding-top: 1.4rem;
             padding-bottom: 2.5rem;
         }
-        [data-testid="stMetricValue"] { font-size: 1.4rem; }
-        [data-testid="stMetric"] { padding: 0.55rem 0.7rem 0.5rem 0.7rem; }
+        .block-container [data-testid="stMetricValue"] { font-size: 1.4rem; }
+        .block-container [data-testid="stMetric"] {
+            padding: 0.55rem 0.7rem 0.5rem 0.7rem;
+        }
         .section-subtitle { font-size: 0.85rem; }
         .st-key-scan img { max-height: 320px; }
     }
@@ -835,14 +858,25 @@ def render_load_error(error: Exception) -> None:
     unreadable, is not one this project wrote, or whose state dict does not fit
     its architecture is reported -- and it is reported on a page the reader can
     still act on, rather than as the whole app failing.
+
+    Only the first line of the message is shown. `torch.load` failures arrive
+    wrapped in paragraphs explaining that `weights_only` changed in PyTorch 2.6
+    and inviting a bug report, none of which helps someone whose `best.pt` was
+    truncated; the full text is in the terminal running `streamlit run`, which
+    `main` logs it to.
     """
-    st.error(f"The model could not be loaded: {error}")
+    detail = " ".join(str(error).split())
+    if len(detail) > 200:
+        detail = detail[:200].rstrip() + "..."
+    if not detail:
+        detail = type(error).__name__
+    st.error(f"The model could not be loaded: {detail}")
     st.markdown(
         "The checkpoint is listed in the sidebar but could not be rebuilt. The "
-        "message above comes from `src/evaluate.load_checkpoint` and names what "
-        "went wrong; the usual causes are a half-written `best.pt` from an "
-        "interrupted run, or an architecture whose constructor defaults changed "
-        "after the run. Retrain, or delete the run directory."
+        "message above is what `src/evaluate.load_checkpoint` raised; the usual "
+        "causes are a half-written `best.pt` from an interrupted run, or an "
+        "architecture whose constructor defaults changed after the run. Retrain, "
+        "or delete the run directory, then reload this page."
     )
 
 
@@ -1773,7 +1807,16 @@ def render_result(
             # with something vaguer.
             st.error(str(error))
             return
-        except RuntimeError as error:
+        except Exception as error:  # noqa: BLE001 - see the comment below
+            # Broad for the same reason as in `main`, and it costs the same when it
+            # is wrong: which exceptions a load of someone else's image can raise
+            # is not knowable in advance, and the cases that are easy to forget are
+            # not rare ones -- PIL raises `DecompressionBombError` for a crafted
+            # header, and that is not an `OSError`. The traceback would land on top
+            # of a page whose model information and history are still perfectly
+            # good, hiding them behind a stack trace about a file the reader only
+            # just chose. It goes to the terminal instead.
+            logger.exception("Could not classify %s", name)
             st.error(f"The scan could not be classified: {error}")
             return
 
@@ -1813,10 +1856,22 @@ def main() -> None:
 
     # Loaded before the uploader is even drawn. See the docstring: the page
     # describes what it is about to use rather than waiting to be asked.
+    #
+    # The `except` is deliberately `Exception` rather than a list of the types a
+    # bad checkpoint is known to raise. That list is a guess, and a guess here is
+    # expensive: an unlisted type escapes as a red traceback that replaces the
+    # whole page, which is the one outcome `render_load_error` exists to prevent.
+    # (A corrupt `best.pt` raises `_pickle.UnpicklingError`, which is neither
+    # `OSError` nor `RuntimeError`, so the narrower version of this handler was
+    # not hypothetical.) The traceback still reaches the terminal, so nothing is
+    # hidden from whoever is developing the app; only the page gets the short
+    # version. `KeyboardInterrupt` and `SystemExit` are not `Exception` and still
+    # stop the server, as they should.
     try:
         with st.spinner("Loading the model..."):
             model, info, device = _load_model(str(settings.checkpoint), settings.device)
-    except (FileNotFoundError, ValueError, RuntimeError) as error:
+    except Exception as error:
+        logger.exception("Could not load the checkpoint %s", settings.checkpoint)
         render_load_error(error)
         return
 
