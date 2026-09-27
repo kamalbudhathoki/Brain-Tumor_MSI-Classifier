@@ -1,10 +1,12 @@
 # Brain Tumor MRI Classifier
 
-Production-oriented project scaffold for classifying brain tumor MRI scans with PyTorch.
+PyTorch project for classifying brain tumor MRI scans, built so that every number it
+reports can be traced back to the split and the checkpoint it came from.
 
-> **Status: scaffold only — no model, training, or inference logic is implemented yet.**
-> This repository currently defines the structure, conventions, and contracts that the
-> implementation will follow.
+> **Status: data, model, training, evaluation, and single-scan inference are
+> implemented; there is no trained checkpoint in this repo and no batch mode or
+> Grad-CAM yet.** `models/` ships empty, so both entry points report that plainly
+> rather than inventing a model.
 
 ---
 
@@ -95,7 +97,7 @@ the top of `requirements.txt`).
 | Concern | Rule |
 | --- | --- |
 | Data leakage | Split by **patient**, never by slice. |
-| Reproducibility | Seed Python/NumPy/PyTorch; save `config.yaml` + seed with every run. |
+| Reproducibility | Seed Python/NumPy/PyTorch; the run's `TrainConfig` and seed are saved inside every checkpoint. |
 | Checkpoints | Self-describing: arch, class names, image size, normalization, epoch, metrics. |
 | Preprocessing | Always read it from the checkpoint — never hardcode it in the UI. |
 | Logging | Logger in `src/`, `print` only in notebooks. |
