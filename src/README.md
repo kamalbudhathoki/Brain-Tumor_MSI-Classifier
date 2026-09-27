@@ -24,6 +24,10 @@ src/
     └── logging.py   # structured run logging
 ```
 
+`inference.py` is implemented. It is the only place model logic lives at prediction
+time, and both entry points over it — `../predict.py` (CLI) and `../app.py` (UI) —
+call it rather than reimplementing any of it.
+
 ## Rules
 
 - No `print` in library code — use the logger.

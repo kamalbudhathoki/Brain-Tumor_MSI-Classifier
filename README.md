@@ -34,6 +34,7 @@ brain-tumor-classifier/
 ├── outputs/        # Derived run artifacts: logs, metrics, curves, figures,
 │                   #   TensorBoard events. Git-ignored (regenerable).
 ├── app.py          # Application entry point (inference UI). Currently a stub.
+├── predict.py      # Classify one scan from the CLI: predicted class + confidence
 ├── requirements.txt
 ├── README.md
 └── .gitignore
@@ -42,6 +43,14 @@ brain-tumor-classifier/
 The split is deliberate: **`data/` and `models/` are inputs, `src/` is logic, `outputs/`
 is disposable.** Nothing in `outputs/` is ever read at inference time, and no logic
 lives in `notebooks/`.
+
+`predict.py` and `app.py` are both entry points over `src/inference.py`, and
+neither contains model logic:
+
+```powershell
+python predict.py path\to\scan.jpg
+python predict.py path\to\scan.jpg --checkpoint models\<run>\best.pt --json
+```
 
 ---
 

@@ -19,7 +19,6 @@ OUTPUT
 
           image        scan.jpg
           checkpoint   models\\run1\\best.pt
-          model        resnet18 (epoch 17)
 
           Predicted class   Glioma
           Confidence        94.31%
@@ -33,8 +32,21 @@ OUTPUT
           Meningioma       2.44%
           Pituitary        0.14%
 
+          * predicted class.  Image resized to 224x224.
+
+        Research output only -- not for diagnosis or treatment decisions.
+        Confidence is the model's softmax score, not a calibrated probability of
+        a correct diagnosis.
+
     Add --json to get the same numbers as a machine-readable object instead, for
-    scripting or piping into something else.
+    scripting or piping into something else, and --brief to drop the distribution
+    and keep the two headline lines.
+
+    The architecture and epoch are on stderr rather than in the report, in the
+    "Loaded models/run1/best.pt (arch=resnet18, epoch=17)" log line -- the
+    checkpoint path already names the run, so repeating it in the header would
+    add a line to every report and identify nothing new. Stdout is kept to the
+    report alone so it can be redirected without dragging log lines along.
 
 WHY THIS FILE IS ALMOST EMPTY
 ----------------------------
@@ -132,7 +144,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--brief",
         action="store_true",
-        help="print only the predicted class and the confidence",
+        help="print only the predicted class and the confidence, without the "
+        "full per-class distribution",
     )
     parser.add_argument(
         "--json",
@@ -151,7 +164,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--quiet",
         "-q",
         action="store_true",
-        help="suppress the loading and preprocessing log lines on stderr",
+        help="silence the log output on stderr, warnings included. It hides the "
+        "preprocessing-mismatch warning from src/inference.py as well as the "
+        "progress lines, so do not use it when a checkpoint's preprocessing is "
+        "in doubt",
     )
 
     args = parser.parse_args(argv)
@@ -170,15 +186,28 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     logging.basicConfig(
-        level=logging.WARNING if args.quiet else logging.INFO,
+        # ERROR, not WARNING, when quiet: the shared resolve_device() in
+        # src/train.py logs its "no GPU detected" fallback at WARNING, so a
+        # WARNING-level quiet would still leave that line on stderr.
+        level=logging.ERROR if args.quiet else logging.INFO,
         format=LOG_FORMAT,
         datefmt=LOG_DATEFMT,
     )
 
-    if not args.image.is_file():
+    if not args.image.exists():
         # Checked before the model loads, so a typo'd path costs a millisecond
         # rather than a checkpoint read, and the error names the actual problem.
         print(f"error: no such image: {args.image}", file=sys.stderr)
+        return 1
+    if not args.image.is_file():
+        # Distinguished from "missing" because the two have different fixes: a
+        # directory is a wrong argument (this CLI takes one file), not a typo.
+        print(
+            f"error: {args.image} is not a file. This CLI takes a single image; "
+            "point it at one file, or use src.inference.predict_files() for a "
+            "list of paths.",
+            file=sys.stderr,
+        )
         return 1
 
     try:
@@ -208,6 +237,7 @@ def main(argv: list[str] | None = None) -> int:
                 prediction,
                 image=args.image,
                 checkpoint=args.checkpoint,
+                show_all=not args.brief,
             )
         )
 

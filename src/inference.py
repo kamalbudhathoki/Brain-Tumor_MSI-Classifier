@@ -425,6 +425,36 @@ def predict_tensor(
     """
     model.eval()
 
+    # Checked here rather than left to the first convolution. A 3-D [3, H, W]
+    # tensor -- which is exactly what `BrainTumorDataset.__getitem__` returns,
+    # and the obvious thing for a caller to pass -- reaches BatchNorm2d as if it
+    # were a batch of three unbatched images and fails six frames deep with
+    # "expected 4D input (got 3D input)", naming a tensor the caller never
+    # mentioned. This names the fix instead.
+    if tensor.dim() == 3:
+        raise ValueError(
+            f"predict_tensor expects a batched tensor [1, 3, H, W], got [3, H, W] "
+            f"({tuple(tensor.shape)}). Add the batch dimension with "
+            f"`.unsqueeze(0)`, or use predict_file()/load_image(), which do it "
+            f"for you."
+        )
+    if tensor.dim() != 4:
+        raise ValueError(
+            f"predict_tensor expects a 4-D tensor [1, 3, H, W], got "
+            f"{tensor.dim()}-D {tuple(tensor.shape)}."
+        )
+    if tensor.shape[0] != 1:
+        raise ValueError(
+            f"predict_tensor classifies one image, so the batch dimension must be "
+            f"1, got {tensor.shape[0]}. For several images, loop and call this "
+            f"per image, or use src/evaluate.collect_predictions over a DataLoader."
+        )
+    if tensor.shape[1] != 3:
+        raise ValueError(
+            f"Expected 3 channels (grayscale scans are replicated to RGB), got "
+            f"{tensor.shape[1]} in {tuple(tensor.shape)}."
+        )
+
     with torch.inference_mode():
         logits = model(tensor.to(device))
         probabilities = logits.softmax(dim=1)
