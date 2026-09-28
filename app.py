@@ -235,11 +235,13 @@ HISTORY_KEY = "prediction_history"
 HISTORY_TOTAL_KEY = "prediction_history_total"
 
 #: Explicit keys for the two clear buttons. They run the same callback and would
-#: otherwise be the same widget drawn twice, which Streamlit rejects. Also the
-#: uploader's, so the widget's state can be addressed by name.
+#: otherwise be the same widget drawn twice, which Streamlit rejects.
 UPLOAD_KEY = "scan_upload"
 CLEAR_KEY = "clear_history_sidebar"
 CLEAR_KEY_BODY = "clear_history_body"
+
+#: Session-state counter that scopes the uploader's key. See `_upload_widget_key`.
+UPLOAD_GENERATION_KEY = "upload_generation"
 
 #: Viewport width, in CSS pixels, below which the page stops being a two-column
 #: desktop layout. Not a magic number of our own: Streamlit's own column CSS
@@ -972,13 +974,33 @@ def upload_problem(data: bytes) -> str | None:
     return None
 
 
+def _upload_widget_key() -> str:
+    """The uploader's widget key for the current generation.
+
+    Streamlit matches a widget's stored state by key, so changing the key gives
+    the uploader a fresh identity and an empty value. That is the supported way to
+    clear a file uploader, and it is needed because `st.session_state` explicitly
+    refuses to hold one: assigning `None` to a file uploader's key raises
+    "Values for the widget with `key` ... cannot be set using `st.session_state`",
+    which is what the obvious implementation does.
+
+    The suffix is what makes "Clear history" visible. Prediction runs on upload
+    and re-runs on every rerun, so clearing the rows while a file was still
+    selected left the scan on screen, the next rerun re-classified it, and
+    `record_prediction` -- which only dedupes against rows still in the list --
+    put it straight back. The list refilled with the row just deleted.
+    """
+    generation = st.session_state.get(UPLOAD_GENERATION_KEY, 0)
+    return f"{UPLOAD_KEY}_{generation}"
+
+
 def render_uploader() -> Any:
     """The upload control, in a card, with what it accepts written under it."""
     with st.container(border=True):
         uploaded = st.file_uploader(
             "Upload an MRI scan",
             type=[suffix.lstrip(".") for suffix in IMAGE_EXTENSIONS],
-            key=UPLOAD_KEY,
+            key=_upload_widget_key(),
             max_upload_size=MAX_UPLOAD_BYTES,
             help="One image per scan: JPEG, PNG, BMP, TIFF, or WebP. DICOM and NIfTI "
             "are not supported -- export a slice to PNG first.",
@@ -1542,16 +1564,15 @@ def clear_history() -> None:
     straight back. The list refilled with the one row that had just been deleted
     and the button looked broken.
 
-    Assigning `None` rather than popping the key: the uploader is a widget, and
-    Streamlit keeps a widget's own state keyed separately from session state, so
-    removing the entry leaves the file attached to the widget. This runs as a
-    callback, i.e. before the next run creates the uploader, which is the point at
-    which an assignment is honoured.
+    Bumping the generation rather than assigning to the uploader's key, because
+    Streamlit refuses the latter outright for a file uploader. See
+    `_upload_widget_key`.
     """
     st.session_state.pop(HISTORY_KEY, None)
     st.session_state.pop(HISTORY_TOTAL_KEY, None)
-    if UPLOAD_KEY in st.session_state:
-        st.session_state[UPLOAD_KEY] = None
+    st.session_state[UPLOAD_GENERATION_KEY] = (
+        int(st.session_state.get(UPLOAD_GENERATION_KEY, 0)) + 1
+    )
     logger.info("Prediction history cleared")
 
 
