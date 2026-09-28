@@ -1102,6 +1102,27 @@ def _provenance(prediction: Prediction, info: CheckpointInfo) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _effective_input_size(info: CheckpointInfo, settings: Settings) -> int | None:
+    """The side length actually fed to the forward pass, or None if unknowable.
+
+    The sidebar override wins, then the checkpoint's own recorded size. None means
+    the checkpoint carries no size *and* no override was given, which is a real
+    state rather than an error to paper over: `resolve_image_size` raises rather
+    than guessing, and the two callers of this helper display the result on a page
+    that is drawn whether or not anything has been uploaded, so both need to be
+    able to say "not recorded" instead of a number.
+
+    Split out from `_input_size_text` so the metric and the fact row cannot
+    disagree about what was used -- the metric's whole job is to be the one number
+    on the page that says what the model was given.
+    """
+    if settings.image_size is not None:
+        return settings.image_size
+    if info.image_size >= 1:
+        return info.image_size
+    return None
+
+
 def _input_size_text(info: CheckpointInfo, settings: Settings) -> str:
     """The input size actually in force, and where it came from.
 
@@ -1111,11 +1132,12 @@ def _input_size_text(info: CheckpointInfo, settings: Settings) -> str:
     override is shown as the source when it is the reason, so a size that came
     from a text box does not look like one that came from the checkpoint.
     """
+    size = _effective_input_size(info, settings)
+    if size is None:
+        return "not recorded"
     if settings.image_size is not None:
-        return f"{settings.image_size}×{settings.image_size} (overridden)"
-    if info.image_size >= 1:
-        return f"{info.image_size}×{info.image_size}"
-    return "not recorded"
+        return f"{size}×{size} (overridden)"
+    return f"{size}×{size}"
 
 
 def _mean_std(values: Sequence[float] | None) -> str:
@@ -1194,14 +1216,27 @@ def render_model_info(
         with top[2]:
             st.metric("Classes", str(info.num_classes), border=True)
         with top[3]:
+            # The size actually used, not the checkpoint's recorded one. The two
+            # differ whenever the sidebar override is filled in, and this metric is
+            # the number a reader checks before believing anything above it -- it
+            # said 224x224 on a run that fed the model 128x128, contradicting the
+            # "input size used" row in the preprocessing table directly below it.
+            size = _effective_input_size(info, settings)
             st.metric(
                 "Input",
-                f"{info.image_size}×{info.image_size}"
-                if info.image_size >= 1
-                else "not recorded",
+                "not recorded" if size is None else f"{size}×{size}",
+                # Same use of the delta line as the Parameters card above: a
+                # caption saying where the number came from, not a change indicator.
+                delta=(
+                    "sidebar override"
+                    if settings.image_size is not None
+                    else None
+                ),
+                delta_color="off",
                 border=True,
                 help="Square side length the image is resized to before the "
-                "forward pass, from the checkpoint.",
+                "forward pass. The checkpoint's own value, unless the sidebar "
+                "override replaced it.",
             )
 
         body = st.columns([1, 1], gap="large")
@@ -1877,10 +1912,9 @@ def main() -> None:
         render_load_error(error)
         return
 
-    # The rest of the sidebar, now that there is something to describe.
-    render_sidebar_model(model, info, device, settings)
-    render_sidebar_session()
-
+    # The rest of the sidebar is drawn at the end of `main`, not here. See the
+    # comment down there: it is display-only, and drawing it here would have it
+    # describe a session state that this run is about to change.
     uploaded = render_uploader()
     if uploaded is None:
         render_waiting()
@@ -1889,6 +1923,19 @@ def main() -> None:
 
     render_model_info(model, info, device, settings)
     render_history()
+
+    # Last, so the sidebar describes the session as it is *after* the upload
+    # above was classified. Streamlit runs this script top to bottom and snapshots
+    # each `st.*` call as it happens, so the sidebar is not re-read at the end of
+    # the run -- anything drawn before `render_result` has already been decided.
+    # Called here, the panel said "Nothing classified yet" on the very run that
+    # recorded a scan, with the clear button disabled, and only corrected itself
+    # on whatever later, unrelated interaction happened to trigger a rerun.
+    # Nothing else moves: sidebar order is the order these two calls are made in,
+    # which is unchanged, and they still need a loaded model, so both early
+    # returns above skip them.
+    render_sidebar_model(model, info, device, settings)
+    render_sidebar_session()
 
 
 if __name__ == "__main__":
