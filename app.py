@@ -1808,12 +1808,14 @@ def render_result(
             st.error(str(error))
             return
         except Exception as error:  # noqa: BLE001 - see the comment below
-            # Broad for the same reason as in `main`, and it costs the same when it
-            # is wrong: which exceptions a load of someone else's image can raise
-            # is not knowable in advance, and the cases that are easy to forget are
-            # not rare ones -- PIL raises `DecompressionBombError` for a crafted
-            # header, and that is not an `OSError`. The traceback would land on top
-            # of a page whose model information and history are still perfectly
+            # Broad for the same reason as in `main`, and demonstrated rather than
+            # theorised: a PNG whose IHDR length field is wrong raises a bare
+            # `OSError("Truncated File Read")` out of PIL, which is not one of the
+            # types listed above (`FileNotFoundError` is a subclass of `OSError`,
+            # not the other way round, so it was not caught). `load_image` converts
+            # `UnidentifiedImageError` to `ValueError` but has no reason to know
+            # about the rest of what PIL can raise, and a traceback would land on
+            # top of a page whose model information and history are still perfectly
             # good, hiding them behind a stack trace about a file the reader only
             # just chose. It goes to the terminal instead.
             logger.exception("Could not classify %s", name)
