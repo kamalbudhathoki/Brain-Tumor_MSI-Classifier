@@ -97,6 +97,12 @@ so it is the part that has to stay small. The filename, the label, the
 confidence, the whole distribution and the checkpoint name are the numbers; the
 scan itself is still on the reader's disk.
 
+Clearing the list also drops the selected upload, so the page returns to its
+waiting state. That is a consequence of the run-on-upload design rather than a
+separate feature: the result panel re-classifies on every rerun, so a clear that
+left the file selected would be undone by the next run and the button would
+appear to do nothing.
+
 The history also has no mean confidence. `src/inference.py` deliberately refuses
 to average confidences across images -- an average over a set of scans means
 nothing about any of them -- and adding one here would put the number the module
@@ -279,6 +285,7 @@ SCOPE_NOTE = (
 def _load_model(
     checkpoint: str,
     device_spec: str,
+    revision: str,
 ) -> tuple[torch.nn.Module, CheckpointInfo, torch.device]:
     """Load a checkpoint once and keep it for the life of the server process.
 
@@ -291,6 +298,23 @@ def _load_model(
 
     Args are `str` because `cache_resource` hashes its arguments.
 
+    `revision` is not read here. It exists only so the cache key changes when the
+    file's *contents* do, and is built by `_checkpoint_revision` from the file's
+    size and modification time. Keying on the path alone -- which is all
+    `checkpoint` identifies -- is a silent-wrong-answer bug rather than a
+    performance one: `python -m src.train` writes to `models/<run>/best.pt`, so
+    retraining into a run name that already exists replaces the file under a path
+    the cache has already seen. The app would then keep answering with the
+    previous run's weights while the sidebar's "trained" timestamp and file size
+    updated to describe the new ones, and nothing on the page would say the
+    numbers are from a model the reader is not looking at.
+
+    A file that is replaced without changing either its size or its mtime would
+    still be served from cache. mtime is nanosecond-resolution on NTFS and ext4
+    and second-resolution on some network mounts; two retrains landing in the
+    same tick *and* producing the same byte count is not a case worth a hash of
+    45MB on every rerun.
+
     Returns:
         (model, info, device) -- everything `predict_image` needs, plus the device
         the model was placed on.
@@ -300,7 +324,7 @@ def _load_model(
             The file lives in `models/`, so it is a file the user put there, and
             what a bad one raises depends on how it is bad: a truncated archive
         raises from `pickle`, a `state_dict` that no longer fits its architecture
-            raises from `torch.nn`, an unexpected dtype raises from `torch.load`.
+        raises from `torch.nn`, an unexpected dtype raises from `torch.load`.
             `main` reports all of them the same way, and this function has nothing
             useful to add to the message.
 
@@ -319,6 +343,21 @@ def _load_model(
     # view, and a warning repeated on every interaction is a warning nobody reads.
     check_preprocessing(info)
     return model, info, device
+
+
+def _checkpoint_revision(path: Path) -> str:
+    """A cache-key fragment that changes when the file at `path` changes.
+
+    "missing" for a file that cannot be stat'd, which is a state the loader
+    reports in its own words a moment later; inventing a stable token for a
+    missing file would mean a checkpoint deleted and restored unchanged reused a
+    stale entry.
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        return "missing"
+    return f"{stat.st_mtime_ns}:{stat.st_size}"
 
 
 def _available_devices() -> list[str]:
@@ -818,6 +857,8 @@ def render_sidebar_session() -> None:
         key=CLEAR_KEY,
         disabled=not state.entries,
         width="stretch",
+        help="Empties the list and drops the currently selected scan, so the page "
+        "returns to waiting for one. Upload it again to classify it afresh.",
     )
     st.sidebar.caption(
         "Session-only: these predictions live in this browser tab, are not "
@@ -1487,14 +1528,30 @@ def record_prediction(
 
 
 def clear_history() -> None:
-    """Forget this session's predictions. Wired to both clear buttons.
+    """Forget this session's predictions, and the scan that produced the last one.
 
     A callback rather than an `if` in the body, because the button's return value
     is only True on the run that pressed it, and the history is drawn *before* the
     reader reaches the buttons that would change it.
+
+    Dropping the upload as well as the rows is not a convenience, it is what makes
+    the button do anything. Prediction runs on upload and re-runs on every
+    rerun, so clearing the rows while a file is still selected left the current
+    scan on screen, the very next rerun re-classified it, and `record_prediction`
+    -- which only dedupes against rows that are still in the list -- put it
+    straight back. The list refilled with the one row that had just been deleted
+    and the button looked broken.
+
+    Assigning `None` rather than popping the key: the uploader is a widget, and
+    Streamlit keeps a widget's own state keyed separately from session state, so
+    removing the entry leaves the file attached to the widget. This runs as a
+    callback, i.e. before the next run creates the uploader, which is the point at
+    which an assignment is honoured.
     """
     st.session_state.pop(HISTORY_KEY, None)
     st.session_state.pop(HISTORY_TOTAL_KEY, None)
+    if UPLOAD_KEY in st.session_state:
+        st.session_state[UPLOAD_KEY] = None
     logger.info("Prediction history cleared")
 
 
@@ -1664,6 +1721,9 @@ def render_history() -> None:
                 on_click=clear_history,
                 key=CLEAR_KEY_BODY,
                 width="stretch",
+                help="Empties the list and drops the currently selected scan, so "
+                "the page returns to waiting for one. Upload it again to classify "
+                "it afresh.",
             )
 
         st.dataframe(
@@ -1906,7 +1966,11 @@ def main() -> None:
     # stop the server, as they should.
     try:
         with st.spinner("Loading the model..."):
-            model, info, device = _load_model(str(settings.checkpoint), settings.device)
+            model, info, device = _load_model(
+                str(settings.checkpoint),
+                settings.device,
+                _checkpoint_revision(settings.checkpoint),
+            )
     except Exception as error:
         logger.exception("Could not load the checkpoint %s", settings.checkpoint)
         render_load_error(error)
